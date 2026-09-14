@@ -19,6 +19,11 @@ path = "./src/bin/main.rs"
 name = "imu_demo"
 path = "./src/bin/imu_demo.rs"
 
+# Flashes the TF03 LiDAR driver on its own, without the rest of the application.
+[[bin]]
+name = "lidar_demo"
+path = "./src/bin/lidar_demo.rs"
+
 [dependencies]
 esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
 
