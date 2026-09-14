@@ -14,6 +14,11 @@ path = "./src/lib.rs"
 name = "ping_capstone"
 path = "./src/bin/main.rs"
 
+# Flashes the BNO085 driver on its own, without the rest of the application.
+[[bin]]
+name = "imu_demo"
+path = "./src/bin/imu_demo.rs"
+
 [dependencies]
 esp-hal = { version = "~1.1.0", features = ["esp32s3", "unstable"] }
 
@@ -32,6 +37,7 @@ embassy-net = { version = "0.9.1", features = [
   "tcp",
   "udp",
 ] }
+embedded-hal-async = "1.0.0"
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
 esp-alloc = "0.10.0"
