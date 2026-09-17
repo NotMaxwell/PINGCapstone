@@ -1,0 +1,12 @@
+# Client-agnostic rust-analyzer config (read by rust-analyzer itself,
+# independent of editor settings). See .vscode/settings.json for the
+# background: this project is `no_std` (xtensa-esp32s3-none-elf) and only
+# builds `core`/`alloc` via `build-std`, so there's no `test` crate for the
+# target. Without this, rust-analyzer's default check includes the implicit
+# `--tests` target and fails with "can't find crate for `test`".
+[check]
+allTargets = false
+
+[cargo]
+allTargets = false
+target = "xtensa-esp32s3-none-elf"
