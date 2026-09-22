@@ -1,0 +1,20 @@
+# ESP32-S3-DevKitC-1-N8R8: 8 MB quad flash, 8 MB octal PSRAM.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Required by arduino-esp32 when used as an ESP-IDF component.
+CONFIG_FREERTOS_HZ=1000
+# We provide app_main() ourselves instead of Arduino's setup()/loop().
+CONFIG_AUTOSTART_ARDUINO=n
+
+# micro-ROS over Wi-Fi/UDP. Set the SSID, password and agent IP with
+# `idf.py menuconfig` → "micro-ROS Settings"; keep real credentials out of git.
+CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE=y
+CONFIG_MICRO_ROS_ESP_NETIF_WLAN=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

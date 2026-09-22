@@ -1,0 +1,15 @@
+[submodule "firmware-cpp/external/Adafruit_BNO08x"]
+	path = firmware-cpp/external/Adafruit_BNO08x
+	url = https://github.com/adafruit/Adafruit_BNO08x.git
+[submodule "firmware-cpp/external/Adafruit_BusIO"]
+	path = firmware-cpp/external/Adafruit_BusIO
+	url = https://github.com/adafruit/Adafruit_BusIO.git
+[submodule "firmware-cpp/external/Adafruit_Sensor"]
+	path = firmware-cpp/external/Adafruit_Sensor
+	url = https://github.com/adafruit/Adafruit_Sensor.git
+[submodule "firmware-cpp/external/SparkFun_u-blox_GNSS_v3"]
+	path = firmware-cpp/external/SparkFun_u-blox_GNSS_v3
+	url = https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3.git
+[submodule "firmware-cpp/external/TFMini-Plus"]
+	path = firmware-cpp/external/TFMini-Plus
+	url = https://github.com/budryerson/TFMini-Plus.git

@@ -1,0 +1,8 @@
+dependencies:
+  idf: ">=5.5,<5.6"
+  # Arduino core as an ESP-IDF component: provides Wire/HardwareSerial, which
+  # is the HAL all three vendor drivers are written against.
+  espressif/arduino-esp32: "~3.3.12"
+  # micro-ROS for ROS 2 Jazzy (LTS, supported to 2029). The component's
+  # major version is the distro's release year.
+  micro-ros/micro_ros_espidf_component: "^24"
