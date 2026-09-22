@@ -82,6 +82,9 @@ static_cell      = "2.1.1"
 ublox = { version = "0.10.0", default-features = false, features = [
   "ubx_proto31",
 ] }
+# Trigonometry for turning a LiDAR range and IMU orientation into a
+# coordinate. `core` has no sin, cos or atan2 on stable Rust.
+libm = "0.2.16"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
