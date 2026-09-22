@@ -14,6 +14,11 @@ path = "./src/lib.rs"
 name = "ping_capstone"
 path = "./src/bin/main.rs"
 
+# Flashes the NEO-M9N driver on its own, without the rest of the application.
+[[bin]]
+name = "gps_demo"
+path = "./src/bin/gps_demo.rs"
+
 # Flashes the BNO085 driver on its own, without the rest of the application.
 [[bin]]
 name = "imu_demo"
@@ -71,6 +76,12 @@ smoltcp = { version = "0.13.0", default-features = false, features = [
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
+# UBX framing and message decoding for the NEO-M9N. Protocol 31 is the
+# closest the crate offers to the M9N's 32.01, and carries the same NAV-PVT,
+# MON-VER and CFG-VALSET layouts.
+ublox = { version = "0.10.0", default-features = false, features = [
+  "ubx_proto31",
+] }
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
