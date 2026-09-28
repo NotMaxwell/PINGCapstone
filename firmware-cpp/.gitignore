@@ -1,0 +1,36 @@
+# Build directories
+build/
+cmake-build-*/
+
+# ESP-IDF specific
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.old
+managed_components/
+external/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.cmake
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# Dependencies
+*.elf
+*.bin
+*.map
