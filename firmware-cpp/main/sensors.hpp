@@ -81,6 +81,9 @@ struct Range {
     /// Distance to the target, or nothing when nothing was in range or the
     /// return was too weak to trust.
     std::optional<std::uint16_t> distance_cm;
+    /// The distance field as sent, which reads as the out-of-range threshold
+    /// when there was no usable return.
+    std::uint16_t raw_distance_cm;
     /// Strength of the return, 0 to 3500.
     std::uint16_t strength;
 };
@@ -95,14 +98,17 @@ extern Latest<Range> lidar;
 
 namespace sensors {
 
-/// Keeps readings::gps up to date. Never returns.
-void gps_task();
+// Each starts the FreeRTOS task that brings its sensor up and keeps its
+// reading up to date from then on. Call initArduino() first.
 
-/// Keeps readings::imu up to date. Never returns.
-void imu_task();
+/// Starts the task behind readings::gps.
+void start_gps();
 
-/// Keeps readings::lidar up to date. Never returns.
-void lidar_task();
+/// Starts the task behind readings::imu.
+void start_imu();
+
+/// Starts the task behind readings::lidar.
+void start_lidar();
 
 }  // namespace sensors
 

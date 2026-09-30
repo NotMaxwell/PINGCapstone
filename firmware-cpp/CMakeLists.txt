@@ -22,6 +22,11 @@ if(NOT DEFINED ENV{IDF_TOOLCHAIN})
     set(IDF_TOOLCHAIN "clang" CACHE STRING "ESP-IDF toolchain: clang or gcc")
 endif()
 
+# Which program to build: the application, or one of the demos that runs a
+# single sensor on its own. The CMake presets set this; see README.md.
+set(PING_APP "ping" CACHE STRING "Program to build: ping, gps_demo, imu_demo or lidar_demo")
+set_property(CACHE PING_APP PROPERTY STRINGS ping gps_demo imu_demo lidar_demo)
+
 # The vendored third-party code: the Arduino core and the sensor libraries
 # written for it, each directory an ESP-IDF component. Kept apart from our
 # own components.

@@ -36,12 +36,25 @@ public:
         taskEXIT_CRITICAL(&lock_);
     }
 
-    /// The reading, as long as it is no older than `max_age`.
-    std::expected<T, Stale> get(std::chrono::milliseconds max_age) const
+    /// The reading, and when it arrived.
+    struct Reading {
+        std::chrono::microseconds at;
+        T value;
+    };
+
+    /// The latest reading however old, if there has been one.
+    std::optional<Reading> peek() const
     {
         taskENTER_CRITICAL(&lock_);
         const std::optional<Reading> reading = reading_;
         taskEXIT_CRITICAL(&lock_);
+        return reading;
+    }
+
+    /// The reading, as long as it is no older than `max_age`.
+    std::expected<T, Stale> get(std::chrono::milliseconds max_age) const
+    {
+        const std::optional<Reading> reading = peek();
 
         if (!reading) {
             return std::unexpected(Stale{.sensor = sensor_, .age = std::nullopt});
@@ -54,11 +67,6 @@ public:
     }
 
 private:
-    struct Reading {
-        std::chrono::microseconds at;
-        T value;
-    };
-
     const char* sensor_;
     // A spinlock critical section rather than a mutex: the copy inside is a
     // hundred bytes at most, and it works from either core.

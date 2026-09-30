@@ -16,7 +16,8 @@
         "IDF_TARGET": "esp32s3",
         "IDF_TOOLCHAIN": "clang",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "SDKCONFIG": "${sourceDir}/build/sdkconfig"
+        "SDKCONFIG": "${sourceDir}/build/sdkconfig",
+        "PING_APP": "ping"
       }
     },
     {
@@ -29,6 +30,39 @@
         "IDF_TOOLCHAIN": "gcc",
         "SDKCONFIG": "${sourceDir}/build-gcc/sdkconfig"
       }
+    },
+    {
+      "name": "gps-demo",
+      "displayName": "NEO-M9N GPS demo, Clang",
+      "description": "The NEO-M9N GPS on its own: runs the application's GPS task and prints its readings.",
+      "inherits": "esp32s3",
+      "binaryDir": "${sourceDir}/build-gps-demo",
+      "cacheVariables": {
+        "PING_APP": "gps_demo",
+        "SDKCONFIG": "${sourceDir}/build-gps-demo/sdkconfig"
+      }
+    },
+    {
+      "name": "imu-demo",
+      "displayName": "BNO085 IMU demo, Clang",
+      "description": "The BNO085 IMU on its own: runs the application's IMU task and prints its readings.",
+      "inherits": "esp32s3",
+      "binaryDir": "${sourceDir}/build-imu-demo",
+      "cacheVariables": {
+        "PING_APP": "imu_demo",
+        "SDKCONFIG": "${sourceDir}/build-imu-demo/sdkconfig"
+      }
+    },
+    {
+      "name": "lidar-demo",
+      "displayName": "TF03 LiDAR demo, Clang",
+      "description": "The TF03 LiDAR on its own: runs the application's LiDAR task and prints its readings.",
+      "inherits": "esp32s3",
+      "binaryDir": "${sourceDir}/build-lidar-demo",
+      "cacheVariables": {
+        "PING_APP": "lidar_demo",
+        "SDKCONFIG": "${sourceDir}/build-lidar-demo/sdkconfig"
+      }
     }
   ],
   "buildPresets": [
@@ -39,6 +73,18 @@
     {
       "name": "esp32s3-gcc",
       "configurePreset": "esp32s3-gcc"
+    },
+    {
+      "name": "gps-demo",
+      "configurePreset": "gps-demo"
+    },
+    {
+      "name": "imu-demo",
+      "configurePreset": "imu-demo"
+    },
+    {
+      "name": "lidar-demo",
+      "configurePreset": "lidar-demo"
     }
   ]
 }

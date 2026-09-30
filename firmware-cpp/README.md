@@ -48,6 +48,7 @@ main/                 the application
   sensors.cpp           one task per sensor, on the vendored libraries
   sighting.cpp          the button press: readings -> coordinate
   main.cpp              Arduino start-up, the tasks, the button loop
+  demos/                one sensor at a time: gps_demo, imu_demo, lidar_demo
 components/geo/       range + orientation -> coordinate (plain C++)
 vendor/               Arduino core and sensor libraries, unmodified
 test/host/            host build of the geometry
@@ -84,7 +85,7 @@ cmake --build --preset esp32s3    # build/ping.bin
 Plain `cmake -B build -G Ninja` works too, since `CMakeLists.txt` defaults
 the target and toolchain itself, and so does `idf.py build`. The
 `esp32s3-gcc` preset builds the same code with GCC, into `build-gcc/`. Both
-build with no warnings. The images come out at 407 KB with Clang and 353 KB
+build with no warnings. The images come out at 431 KB with Clang and 372 KB
 with GCC, of the 1 MB app partition. `build/compile_commands.json` is
 exported for clangd.
 
@@ -108,6 +109,30 @@ cmake --build --preset esp32s3 --target monitor    # Ctrl-] to quit
 
 or `idf.py -p $ESPPORT flash monitor`. Result lines and the diagnostics share
 the console; result lines start with `target #`.
+
+## Single-sensor demos
+
+Like the Rust `gps_demo`, `imu_demo` and `lidar_demo` binaries, each demo
+brings up one sensor on its own and prints what it reads. Use them to check
+the wiring one sensor at a time. They run the application's own sensor
+tasks, so a sensor that works in its demo works in the application.
+
+```sh
+cmake --preset gps-demo && cmake --build --preset gps-demo      # build-gps-demo/
+cmake --build --preset gps-demo --target flash monitor
+```
+
+and likewise `imu-demo` and `lidar-demo`. Each has its own build directory,
+so switching between them and the application costs no rebuild. They print:
+
+| Demo | Prints |
+|---|---|
+| `gps-demo` | every solution: `41.2565000, -95.9345000 +/-1.8 m, 14 satellites`, or `no fix (no fix, 3 satellites)` |
+| `imu-demo` | the rotation vector, ten times a second: `quat i=0.0123 j=-0.0045 k=0.7071 r=0.7070 (+/- 0.035 rad, high)` |
+| `lidar-demo` | the distance, ten times a second: `distance 1234 cm (strength 812)`, or `out of range (raw 18000 cm, strength 12)` |
+
+Under the hood the program is picked by the `PING_APP` cache variable:
+`ping`, `gps_demo`, `imu_demo` or `lidar_demo`.
 
 ## Wiring
 
@@ -171,6 +196,5 @@ and within 3 cm at 85°.
 ## Not yet done
 
 - The Wi-Fi web server, which the Rust firmware only initialised.
-- The single-sensor demo binaries (`gps_demo`, `imu_demo`, `lidar_demo`).
 - None of this has run on hardware yet. It builds cleanly with both
   toolchains, but it needs a first run on the bench.

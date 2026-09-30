@@ -40,16 +40,6 @@ namespace ping {
 
 namespace {
 
-// Stack sizes, in bytes. Every task formats log lines, and SparkFun's
-// library parses UBX on the GPS task's stack.
-constexpr std::uint32_t kGpsStack = 8192;
-constexpr std::uint32_t kImuStack = 6144;
-constexpr std::uint32_t kLidarStack = 6144;
-
-/// The sensor tasks run above app_main's priority of 1, so a button press
-/// never holds up a reading.
-constexpr UBaseType_t kSensorPriority = 5;
-
 /// A push button to ground, with the pin's pull-up holding it high.
 class Button {
 public:
@@ -122,9 +112,9 @@ void send_line(std::uint32_t press, std::string_view result, bool located)
     static Button button{config::kButtonPin};
 
     // Each task opens its own sensor; the wiring is in config.hpp.
-    rtos::spawn<sensors::gps_task>("gps", kGpsStack, kSensorPriority);
-    rtos::spawn<sensors::imu_task>("imu", kImuStack, kSensorPriority);
-    rtos::spawn<sensors::lidar_task>("lidar", kLidarStack, kSensorPriority);
+    sensors::start_gps();
+    sensors::start_imu();
+    sensors::start_lidar();
 
     std::uint32_t presses = 0;
     for (;;) {

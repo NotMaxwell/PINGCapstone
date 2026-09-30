@@ -67,6 +67,16 @@ constexpr const char* kLidarTag = "lidar";
 /// otherwise keep the task spinning.
 constexpr int kMaxImuReadsPerWake = 32;
 
+// Stack sizes, in bytes. Every task formats log lines, and SparkFun's
+// library parses UBX on the GPS task's stack.
+constexpr std::uint32_t kGpsStack = 8192;
+constexpr std::uint32_t kImuStack = 6144;
+constexpr std::uint32_t kLidarStack = 6144;
+
+/// The sensor tasks run above app_main's priority of 1, so nothing the main
+/// task does holds up a reading.
+constexpr UBaseType_t kPriority = 5;
+
 /// How often the GPS and IMU tasks look for new data. The GPS delivers ten
 /// solutions a second and the IMU a hundred reports.
 constexpr std::chrono::milliseconds kPollInterval{1};
@@ -147,8 +157,6 @@ bool wait_for_interrupt(std::chrono::milliseconds timeout)
     return true;
 }
 
-}  // namespace
-
 void gps_task()
 {
     static SFE_UBLOX_GNSS_SERIAL gnss;
@@ -156,6 +164,11 @@ void gps_task()
     Serial2.setRxBufferSize(1024);
     Serial2.begin(config::kGpsBaud, SERIAL_8N1, config::kGpsRxPin, config::kGpsTxPin);
     retry(kGpsTag, "Looking for the GPS", [] { return gnss.begin(Serial2); });
+    if (gnss.getModuleInfo()) {
+        ESP_LOGI(kGpsTag, "GPS found: %s, %s firmware %u.%02u, protocol %u.%02u", gnss.getModuleName(),
+                 gnss.getFirmwareType(), gnss.getFirmwareVersionHigh(), gnss.getFirmwareVersionLow(),
+                 gnss.getProtocolVersionHigh(), gnss.getProtocolVersionLow());
+    }
 
     for (;;) {
         // The configuration lives in the receiver's RAM, so this runs again
@@ -255,6 +268,7 @@ void lidar_task()
             continue;
         }
 
+
         // The TF03 sends kLidarOutOfRangeCm when nothing is in range, and its
         // returns below kLidarMinStrength are not to be trusted.
         const auto distance = static_cast<std::uint16_t>(distance_cm);
@@ -262,9 +276,27 @@ void lidar_task()
         const bool usable = distance < config::kLidarOutOfRangeCm && flux >= config::kLidarMinStrength;
         readings::lidar.set(Range{
             .distance_cm = usable ? std::optional{distance} : std::nullopt,
+            .raw_distance_cm = distance,
             .strength = flux,
         });
     }
+}
+
+}  // namespace
+
+void start_gps()
+{
+    rtos::spawn<gps_task>("gps", kGpsStack, kPriority);
+}
+
+void start_imu()
+{
+    rtos::spawn<imu_task>("imu", kImuStack, kPriority);
+}
+
+void start_lidar()
+{
+    rtos::spawn<lidar_task>("lidar", kLidarStack, kPriority);
 }
 
 }  // namespace sensors
