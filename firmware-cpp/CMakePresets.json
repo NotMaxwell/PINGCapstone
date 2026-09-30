@@ -9,7 +9,7 @@
     {
       "name": "esp32s3",
       "displayName": "ESP32-S3, Clang",
-      "description": "ESP-IDF build for the ESP32-S3 with Espressif's LLVM toolchain. Needs IDF_PATH set and the ESP-IDF tools on PATH (source export.sh).",
+      "description": "ESP-IDF build for the ESP32-S3 with Espressif's LLVM toolchain. Needs ESP-IDF v5.5: IDF_PATH set and its tools on PATH (source export.sh).",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {

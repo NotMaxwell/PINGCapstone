@@ -64,9 +64,7 @@ std::expected<Sighting, Problem> take_sighting()
         .longitude_deg = position->longitude_deg,
         .altitude_m = solution->height_msl_m,
     };
-    const bno085::Quaternion& q = orientation->quaternion;
-    const geo::Aim aim = geo::Aim::from_orientation({.i = q.i, .j = q.j, .k = q.k, .real = q.real},
-                                                    config::kLidarBoresight,
+    const geo::Aim aim = geo::Aim::from_orientation(orientation->quaternion, config::kLidarBoresight,
                                                     config::kMagneticDeclinationDeg);
     const float range_m = static_cast<float>(*measurement->distance_cm) / 100.0F;
 
@@ -94,7 +92,7 @@ std::string_view describe(const Sighting& s, std::span<char> out)
                     static_cast<double>(s.aim.elevation_deg), s.origin.latitude_deg,
                     s.origin.longitude_deg, s.origin.altitude_m,
                     static_cast<double>(s.origin_accuracy_m), s.satellites,
-                    static_cast<double>(s.heading_accuracy_deg), bno085::to_string(s.compass));
+                    static_cast<double>(s.heading_accuracy_deg), to_string(s.compass));
 }
 
 std::string_view describe(const Problem& problem, std::span<char> out)
@@ -108,7 +106,7 @@ std::string_view describe(const Problem& problem, std::span<char> out)
             },
             [&](const NoFix& no_fix) {
                 return print_to(out, "GPS has no usable fix (%s, %u satellites)",
-                                neo_m9n::to_string(no_fix.fix_type), no_fix.satellites);
+                                to_string(no_fix.fix_type), no_fix.satellites);
             },
             [&](const NoReturn& no_return) {
                 return print_to(out, "LiDAR has no return it trusts (strength %u)", no_return.strength);

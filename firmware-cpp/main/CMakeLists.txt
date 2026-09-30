@@ -2,7 +2,13 @@
 idf_component_register(
     SRCS "main.cpp" "sensors.cpp" "sighting.cpp"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES bno085 neo_m9n tf03 geo esp_driver_gpio esp_driver_uart esp_driver_i2c esp_timer)
+    PRIV_REQUIRES
+        arduino-esp32
+        Adafruit_BNO08x
+        SparkFun_u-blox_GNSS_v3
+        TFMini-Plus
+        geo
+        esp_timer)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/ping_cxx.cmake)
 ping_cxx_component(${COMPONENT_LIB})

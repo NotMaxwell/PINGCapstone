@@ -1,7 +1,8 @@
 # PING firmware, C++
 
-A C++23 port of the Rust firmware in `../src`, for the ESP32-S3 on ESP-IDF
-and FreeRTOS, built by CMake with Espressif's LLVM/Clang.
+A C++23 port of the Rust firmware in `../src` for the ESP32-S3. It runs on
+ESP-IDF and FreeRTOS, uses the Arduino core for ESP32 as its hardware layer,
+and is built by CMake with Espressif's LLVM/Clang.
 
 Aim the device at something, press the button, and it prints that thing's
 GPS coordinate on the USB serial port:
@@ -16,53 +17,51 @@ press takes the three readings and walks the LiDAR's range out from the GPS
 position along the direction the IMU says the LiDAR points. The Wi-Fi web
 server the Rust firmware was preparing for is not ported yet.
 
-## Sensor drivers
+## The hardware layer, and the drivers on it
 
-Each sensor uses its maker's own host library where one exists. The libraries
-are copied into `vendor/` rather than fetched by a package manager, and each
-has a `README.md` saying where it came from and what, if anything, was
-changed.
+This firmware writes none of its own hardware access. The hardware layer is
+the **Arduino core for ESP32** (Espressif's `arduino-esp32`), used as an
+ESP-IDF component. Its `Wire`, `HardwareSerial`, `pinMode`, `digitalRead`
+and `attachInterrupt` sit on ESP-IDF's drivers and FreeRTOS. Each sensor is
+driven by a library that already targets that API:
 
-| Sensor | Driver | Where |
+| Sensor | Library | Talks over |
 |---|---|---|
-| BNO085 IMU (I²C) | CEVA's **SH-2** library v1.4.0, the reference driver for the BNO08x family. We add the ESP-IDF HAL it asks for: an `sh2_Hal_t` over the `i2c_master` driver plus the INT pin. | `vendor/sh2`, `components/bno085` |
-| NEO-M9N GPS (UART) | u-blox's **ubxlib** v1.5.0, GNSS part only. It handles the UART, UBX framing, `CFG-VALSET` and NAV-PVT decoding. u-blox has discontinued ubxlib (Nov 2024), but it is mature. | `vendor/ubxlib`, `components/neo_m9n` |
-| TF03 LiDAR (UART) | Benewake publishes no driver, only the protocol, so this one is ours: the Rust driver's logic on ESP-IDF's UART driver. Its parser is checked at compile time. | `components/tf03` |
+| BNO085 IMU | **Adafruit BNO08x**, which bundles the SH-2 driver from the chip's maker and implements its HAL | `Wire` (I²C) |
+| NEO-M9N GPS | **SparkFun u-blox GNSS v3**, from the maker of the GPS-15733 board used here | `Serial2` |
+| TF03 LiDAR | **TFMini-Plus** (Bud Ryerson). Benewake ships no driver, and the TF03 speaks the TFMini-Plus's protocol. | `Serial1` |
 
-Everything underneath is ESP-IDF's own drivers (`i2c_master`, `uart`,
-`gpio`, `esp_timer`); there is no hand-rolled HAL.
+All of this lives in `vendor/`, copied in rather than fetched by a package
+manager, with no upstream file modified. `vendor/README.md` lists versions,
+commits and licenses. **TFMini-Plus has no license**; read the note there
+before publishing.
 
 ## Layout
 
 ```
 CMakeLists.txt        ESP-IDF project; defaults to ESP32-S3 + Clang
 CMakePresets.json     cmake --preset esp32s3 (Clang) / esp32s3-gcc
-sdkconfig.defaults    240 MHz, console on USB, 1 kHz tick, -Os
-cmake/ping_cxx.cmake  -std=c++23 and warnings for our components
+sdkconfig.defaults    240 MHz, console on USB, 1 kHz tick, Arduino libraries
+cmake/ping_cxx.cmake  -std=c++23 and warnings for our code
 main/                 the application
   config.hpp            pins, rates, boresight, declination, timeouts
-  sensors.cpp           one task per sensor, with restart on silence
+  sensors.cpp           one task per sensor, on the vendored libraries
   sighting.cpp          the button press: readings -> coordinate
-  main.cpp              wiring and the button loop
-components/
-  bno085/             SH-2 HAL + C++ wrapper
-  neo_m9n/            ubxlib wrapper
-  tf03/               TF03 driver and protocol
-  geo/                range + orientation -> coordinate (no ESP-IDF)
-vendor/
-  sh2/                CEVA SH-2, unmodified
-  ubxlib/             u-blox ubxlib, GNSS subset, unmodified + stubs
-test/host/            host build of geo and the TF03 protocol checks
+  main.cpp              Arduino start-up, the tasks, the button loop
+components/geo/       range + orientation -> coordinate (plain C++)
+vendor/               Arduino core and sensor libraries, unmodified
+test/host/            host build of the geometry
 ```
 
 ## Setting up
 
-You need ESP-IDF v6.1 with the ESP32-S3 GCC toolchain (for its C and C++
-libraries) and Espressif's Clang:
+The Arduino core's current stable release, 3.3, is built on **ESP-IDF
+v5.5**, so that is the release this project needs. Install it with the
+ESP32-S3 GCC toolchain (for its C and C++ libraries) and Espressif's Clang:
 
 ```sh
-git clone -b v6.1 --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf
-cd ~/esp/esp-idf
+git clone -b v5.5.5 --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf-v5.5
+cd ~/esp/esp-idf-v5.5
 ./install.sh esp32s3
 python tools/idf_tools.py install esp-clang
 . ./export.sh      # every new shell: sets IDF_PATH and puts the tools on PATH
@@ -70,7 +69,9 @@ python tools/idf_tools.py install esp-clang
 
 Upstream Clang can't be used here: Xtensa support is only in Espressif's
 fork. ESP-IDF picks the fork when `IDF_TOOLCHAIN=clang`, which this project
-sets by default.
+sets by default. ESP-IDF 5.5 still calls its Clang support experimental and
+says so when you configure; the `esp32s3-gcc` preset is there for when that
+matters.
 
 ## Building
 
@@ -81,15 +82,18 @@ cmake --build --preset esp32s3    # build/ping.bin
 ```
 
 Plain `cmake -B build -G Ninja` works too, since `CMakeLists.txt` defaults
-the target and toolchain itself, and so does `idf.py build`. The `esp32s3-gcc`
-preset builds the same code with GCC, into `build-gcc/`, for comparison; both
-build with no warnings. (Today GCC's image is smaller, 282 KB against Clang's
-355 KB.) `build/compile_commands.json` is exported for clangd.
+the target and toolchain itself, and so does `idf.py build`. The
+`esp32s3-gcc` preset builds the same code with GCC, into `build-gcc/`. Both
+build with no warnings. The images come out at 407 KB with Clang and 353 KB
+with GCC, of the 1 MB app partition. `build/compile_commands.json` is
+exported for clangd.
 
 Settings go in `sdkconfig.defaults`. Each preset generates its full
 `sdkconfig` inside its own build directory, so the two toolchains never share
 one; `cmake --build --preset esp32s3 --target menuconfig` edits it
-interactively.
+interactively. The Arduino core only builds the libraries switched on there
+(`CONFIG_ARDUINO_SELECTIVE_*`): `Wire` and `SPI` today. The web server will
+need `Network`, `WiFi` and `WebServer` back.
 
 ## Flashing and watching
 
@@ -111,12 +115,12 @@ Unchanged from the Rust firmware; all of it lives in `main/config.hpp`.
 
 | Sensor | ESP32-S3 | Sensor pin |
 |---|---|---|
-| NEO-M9N (UART2, 38400) | GPIO15 (TX) | RX1 |
+| NEO-M9N (`Serial2`, 38400) | GPIO15 (TX) | RX1 |
 | | GPIO16 (RX) | TX1 |
-| BNO085 (I2C0, 400 kHz, address 0x4A) | GPIO8 | SDA |
+| BNO085 (`Wire`, 400 kHz, address 0x4A) | GPIO8 | SDA |
 | | GPIO9 | SCL |
 | | GPIO10 | INT (pulled up) |
-| TF03 (UART1, 115200) | GPIO17 (TX) | RxD, blue |
+| TF03 (`Serial1`, 115200) | GPIO17 (TX) | RxD, blue |
 | | GPIO18 (RX) | TxD, brown |
 | Button | GPIO0 | BOOT button, or a switch to ground |
 
@@ -126,8 +130,8 @@ used.
 
 ## Host tests
 
-The geometry and the TF03 parser have no hardware in them, so they also
-build on a desktop with any C++23 compiler:
+The geometry has no hardware in it, so it also builds on a desktop with any
+C++23 compiler:
 
 ```sh
 cmake -S test/host -B build-host -G Ninja -DCMAKE_CXX_COMPILER=clang++
@@ -136,31 +140,37 @@ cmake --build build-host && ctest --test-dir build-host --output-on-failure
 
 `geo_test` checks the aim from known orientations, and checks that the
 projection stays within 6 mm of the exact straight line up to 60° latitude
-and within 3 cm at 85°. The TF03 checks are `static_assert`s in
-`components/tf03/src/protocol_checks.cpp`, so they also run in every
-firmware build.
+and within 3 cm at 85°.
 
-## Notes on the C++
+## Notes
 
-- **C++23, strictly.** ESP-IDF 6.1 compiles C++ as `-std=gnu++26` by
-  default. Our components override that with `-std=c++23`, the newest
-  standard the toolchain supports in full; ESP-IDF's own code keeps its
-  default.
-- **Errors are values.** Exceptions and RTTI stay off, as ESP-IDF ships them.
-  Every driver call returns `std::expected`, and the tasks compose them with
-  `and_then`/`transform`, much as the Rust used `Result` and `?`.
-- **Blocking tasks instead of async.** Where the Rust awaited, each sensor
-  task blocks: on a UART read, on ubxlib, or on the IMU's INT line through a
-  GPIO interrupt and a semaphore. FreeRTOS schedules the rest meanwhile.
-- **No `std::format` or `std::print`.** They pull in ~270 KB of libstdc++,
-  which took the image from 355 KB to 743 KB of the 1 MB app partition and
-  would leave no room for the web server. Output uses ESP-IDF's `ESP_LOGx`
-  and a `snprintf` wrapper marked `[[gnu::format]]`, so format strings are
-  still checked at compile time.
+- **C++23, strictly.** ESP-IDF 5.5 compiles C++ as `gnu++2b`, C++23 with GNU
+  extensions. Our code builds as ISO `-std=c++23`, and the vendored code
+  keeps ESP-IDF's default.
+- **FreeRTOS tasks, not `setup()`/`loop()`.** Arduino's autostart is off.
+  `app_main` calls `initArduino()` and starts one task per sensor, as the
+  Rust started one Embassy task per sensor.
+- **What the tasks still decide for themselves.** They wait for the IMU's INT
+  line before asking the library for reports. They only call the TF03
+  library once a whole frame has arrived, because its `getData()`
+  busy-waits. And they apply the TF03's own out-of-range (18000 cm) and weak
+  return (strength below 40) rules, which the TFMini-Plus library doesn't
+  know about.
+- **Recovery, as in the Rust.** A GPS silent for 3 s is configured again, in
+  case a power glitch put it back to factory NMEA output. An IMU silent for
+  1 s, or one that reset itself, is started again.
+- **No `std::format`.** It pulls in about 270 KB of libstdc++, too much next
+  to a future web server in a 1 MB partition. Output uses `ESP_LOGx` and an
+  `snprintf` wrapper marked `[[gnu::format]]`, so format strings are still
+  checked at compile time.
+- **Build tweaks for the vendored code** live in `CMakeLists.txt`, not in
+  upstream's files. They link `esp_netif` to the core, which upstream gets
+  through a registry package, and switch off the handful of warnings Clang
+  raises in the libraries.
 
-## Not yet ported
+## Not yet done
 
 - The Wi-Fi web server, which the Rust firmware only initialised.
 - The single-sensor demo binaries (`gps_demo`, `imu_demo`, `lidar_demo`).
-- None of this has run on hardware yet. It builds cleanly, but the I²C
-  timing against a real BNO085 in particular needs checking on the bench.
+- None of this has run on hardware yet. It builds cleanly with both
+  toolchains, but it needs a first run on the bench.

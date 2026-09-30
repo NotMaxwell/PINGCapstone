@@ -8,11 +8,6 @@ CONFIG_IDF_TARGET="esp32s3"
 # Full speed, as the Rust firmware ran (CpuClock::max()).
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# newlib, whichever compiler builds. ESP-IDF 6.1 defaults to picolibc under
-# GCC and newlib under Clang; ubxlib's ESP-IDF port calls newlib's integer
-# printf variants, so both toolchains use newlib to stay alike.
-CONFIG_LIBC_NEWLIB=y
-
 # Optimise for size, like the Rust profiles' opt-level = "s".
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
@@ -21,9 +16,58 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 # port (/dev/ttyACM* on Linux, /dev/cu.usbmodem* on macOS, COMx on Windows).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
-# A 1 ms tick, so the millisecond timeouts in the drivers mean what they say.
+# A 1 ms tick. The Arduino core requires it (its delay() and millis() are
+# built on it), and it makes the millisecond timeouts mean what they say.
 CONFIG_FREERTOS_HZ=1000
 
 # app_main formats the result lines, which with doubles takes more stack than
 # the default 3.5 KiB leaves room for.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# ---------------------------------------------------------------------------
+# Arduino core
+# ---------------------------------------------------------------------------
+
+# Our own app_main starts the FreeRTOS tasks; no setup()/loop().
+CONFIG_AUTOSTART_ARDUINO=n
+
+# Build only the Arduino libraries the sensors need: Wire for the IMU, and
+# SPI, which Adafruit BusIO compiles against. The web server will want
+# Network, WiFi and WebServer switched back on.
+CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
+CONFIG_ARDUINO_SELECTIVE_Wire=y
+CONFIG_ARDUINO_SELECTIVE_SPI=y
+CONFIG_ARDUINO_SELECTIVE_ESP_SR=n
+CONFIG_ARDUINO_SELECTIVE_ESP_Video=n
+CONFIG_ARDUINO_SELECTIVE_EEPROM=n
+CONFIG_ARDUINO_SELECTIVE_Preferences=n
+CONFIG_ARDUINO_SELECTIVE_Ticker=n
+CONFIG_ARDUINO_SELECTIVE_Update=n
+CONFIG_ARDUINO_SELECTIVE_Zigbee=n
+CONFIG_ARDUINO_SELECTIVE_FS=n
+CONFIG_ARDUINO_SELECTIVE_SD=n
+CONFIG_ARDUINO_SELECTIVE_SD_MMC=n
+CONFIG_ARDUINO_SELECTIVE_SPIFFS=n
+CONFIG_ARDUINO_SELECTIVE_FFat=n
+CONFIG_ARDUINO_SELECTIVE_LittleFS=n
+CONFIG_ARDUINO_SELECTIVE_Network=n
+CONFIG_ARDUINO_SELECTIVE_Ethernet=n
+CONFIG_ARDUINO_SELECTIVE_PPP=n
+CONFIG_ARDUINO_SELECTIVE_Hash=n
+CONFIG_ARDUINO_SELECTIVE_ArduinoOTA=n
+CONFIG_ARDUINO_SELECTIVE_AsyncUDP=n
+CONFIG_ARDUINO_SELECTIVE_DNSServer=n
+CONFIG_ARDUINO_SELECTIVE_ESPmDNS=n
+CONFIG_ARDUINO_SELECTIVE_HTTPClient=n
+CONFIG_ARDUINO_SELECTIVE_Matter=n
+CONFIG_ARDUINO_SELECTIVE_NetBIOS=n
+CONFIG_ARDUINO_SELECTIVE_WebServer=n
+CONFIG_ARDUINO_SELECTIVE_WiFi=n
+CONFIG_ARDUINO_SELECTIVE_NetworkClientSecure=n
+CONFIG_ARDUINO_SELECTIVE_WiFiProv=n
+CONFIG_ARDUINO_SELECTIVE_BLE=n
+CONFIG_ARDUINO_SELECTIVE_BluetoothSerial=n
+CONFIG_ARDUINO_SELECTIVE_SimpleBLE=n
+CONFIG_ARDUINO_SELECTIVE_RainMaker=n
+CONFIG_ARDUINO_SELECTIVE_OpenThread=n
+CONFIG_ARDUINO_SELECTIVE_Insights=n

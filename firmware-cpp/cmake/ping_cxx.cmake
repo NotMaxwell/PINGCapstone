@@ -1,9 +1,9 @@
 # Compiler settings shared by our own components (not the vendored ones).
 #
-# ESP-IDF compiles C++ as -std=gnu++26 by default. We pin our code to
-# ISO C++23, the newest standard the toolchain supports in full, and turn on
-# the warnings we want to keep clean. Vendored C libraries keep ESP-IDF's
-# defaults so they build exactly as upstream intends.
+# ESP-IDF 5.5 compiles C++ as -std=gnu++2b: C++23 with GNU extensions. Our
+# own code builds as strict ISO C++23, with the warnings we want to keep
+# clean. The vendored code keeps ESP-IDF's defaults, so it builds the way
+# upstream expects.
 
 function(ping_cxx_component target)
     target_compile_options(${target} PRIVATE

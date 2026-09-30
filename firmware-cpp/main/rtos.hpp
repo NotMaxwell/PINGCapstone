@@ -32,17 +32,16 @@ inline void sleep(std::chrono::milliseconds duration)
     vTaskDelay(ticks(duration));
 }
 
-/// Runs `body(arg)` in a new FreeRTOS task. `arg` must outlive the task,
-/// which in this firmware means it is static: no task ever returns.
-template <auto Body, typename Arg>
-void spawn(const char* name, Arg& arg, std::uint32_t stack_bytes, UBaseType_t priority)
+/// Runs `body` in a new FreeRTOS task.
+template <auto Body>
+void spawn(const char* name, std::uint32_t stack_bytes, UBaseType_t priority)
 {
     const BaseType_t created = xTaskCreate(
-        [](void* context) {
-            Body(*static_cast<Arg*>(context));
+        [](void* /*context*/) {
+            Body();
             vTaskDelete(nullptr);
         },
-        name, stack_bytes, &arg, priority, nullptr);
+        name, stack_bytes, nullptr, priority, nullptr);
     configASSERT(created == pdPASS);
 }
 

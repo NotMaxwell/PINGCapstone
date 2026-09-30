@@ -1,7 +1,10 @@
 #include "sensors.hpp"
 
-#include <type_traits>
-#include <utility>
+#include <Adafruit_BNO08x.h>
+#include <Arduino.h>
+#include <SparkFun_u-blox_GNSS_v3.h>
+#include <TFMPlus.h>
+#include <Wire.h>
 
 #include "config.hpp"
 #include "esp_log.h"
@@ -11,11 +14,45 @@ namespace ping {
 
 namespace readings {
 
-Latest<neo_m9n::Solution> gps{"GPS"};
-Latest<bno085::Orientation> imu{"IMU"};
-Latest<tf03::Measurement> lidar{"LiDAR"};
+Latest<GpsFix> gps{"GPS"};
+Latest<Orientation> imu{"IMU"};
+Latest<Range> lidar{"LiDAR"};
 
 }  // namespace readings
+
+const char* to_string(FixType fix)
+{
+    switch (fix) {
+    case FixType::kNoFix: return "no fix";
+    case FixType::kDeadReckoningOnly: return "dead reckoning only";
+    case FixType::kFix2D: return "2D";
+    case FixType::kFix3D: return "3D";
+    case FixType::kGnssPlusDeadReckoning: return "GNSS + dead reckoning";
+    case FixType::kTimeOnly: return "time only";
+    }
+    return "?";
+}
+
+std::optional<LatLon> GpsFix::position() const
+{
+    const bool has_position = fix_type == FixType::kFix2D || fix_type == FixType::kFix3D ||
+                              fix_type == FixType::kGnssPlusDeadReckoning;
+    if (has_position && fix_ok && !invalid_position) {
+        return LatLon{.latitude_deg = latitude_deg, .longitude_deg = longitude_deg};
+    }
+    return std::nullopt;
+}
+
+const char* to_string(Accuracy accuracy)
+{
+    switch (accuracy) {
+    case Accuracy::kUnreliable: return "unreliable";
+    case Accuracy::kLow: return "low";
+    case Accuracy::kMedium: return "medium";
+    case Accuracy::kHigh: return "high";
+    }
+    return "?";
+}
 
 namespace sensors {
 
@@ -25,80 +62,160 @@ constexpr const char* kGpsTag = "gps";
 constexpr const char* kImuTag = "imu";
 constexpr const char* kLidarTag = "lidar";
 
-/// Calls `attempt` until it succeeds, logging each failure and pausing
-/// between tries, and returns what it succeeded with.
+/// Most reports the IMU task reads before giving other tasks a turn. At
+/// 100 Hz the hub has one or two waiting; a hub stuck holding INT low would
+/// otherwise keep the task spinning.
+constexpr int kMaxImuReadsPerWake = 32;
+
+/// How often the GPS and IMU tasks look for new data. The GPS delivers ten
+/// solutions a second and the IMU a hundred reports.
+constexpr std::chrono::milliseconds kPollInterval{1};
+
+/// Calls `attempt` until it returns true, logging each failure and pausing
+/// between tries.
 template <typename Attempt>
-auto retry(const char* tag, const char* what, Attempt attempt)
+void retry(const char* tag, const char* what, Attempt attempt)
 {
-    for (;;) {
-        auto result = attempt();
-        if (result) {
-            if constexpr (std::is_void_v<typename decltype(result)::value_type>) {
-                return;
-            } else {
-                return *std::move(result);
-            }
-        }
-        ESP_LOGW(tag, "%s failed: %s, retrying", what, result.error().message());
+    while (!attempt()) {
+        ESP_LOGW(tag, "%s failed, retrying", what);
         rtos::sleep(config::kRetryDelay);
     }
 }
 
-/// Resets the hub and starts its rotation vector.
-bno085::Result<bno085::ProductId> start(bno085::Bno085& imu)
+// ---------------------------------------------------------------------------
+// GPS
+// ---------------------------------------------------------------------------
+
+/// When the GPS task last heard a solution, in Arduino millis().
+std::uint32_t g_last_solution_ms = 0;
+
+/// SparkFun's library calls this from checkCallbacks(), in the GPS task,
+/// with each UBX-NAV-PVT the receiver sends.
+void on_nav_pvt(UBX_NAV_PVT_data_t* pvt)
 {
-    return imu.start().and_then([&](const bno085::ProductId& id) {
-        return imu.enable_rotation_vector(config::kImuReportIntervalUs).transform([&] { return id; });
+    // NAV-PVT scales position to degrees × 1e7 and lengths to millimetres.
+    readings::gps.set(GpsFix{
+        .fix_type = pvt->fixType <= static_cast<std::uint8_t>(FixType::kTimeOnly)
+                        ? static_cast<FixType>(pvt->fixType)
+                        // Values 6-255 are reserved; no solution worth using
+                        // carries one.
+                        : FixType::kNoFix,
+        .fix_ok = pvt->flags.bits.gnssFixOK != 0,
+        .invalid_position = pvt->flags3.bits.invalidLlh != 0,
+        .satellites = pvt->numSV,
+        .latitude_deg = pvt->lat * 1e-7,
+        .longitude_deg = pvt->lon * 1e-7,
+        .height_msl_m = static_cast<float>(pvt->hMSL) * 1e-3F,
+        .horizontal_accuracy_m = static_cast<float>(pvt->hAcc) * 1e-3F,
     });
+    g_last_solution_ms = millis();
+}
+
+/// UBX only on UART1, one NAV-PVT per solution, kGpsRateHz solutions a
+/// second. Written to the receiver's RAM only, so nothing is left behind in
+/// its flash and a fresh board and a reused one behave the same after a
+/// power cycle.
+bool configure(SFE_UBLOX_GNSS_SERIAL& gnss)
+{
+    return gnss.setUART1Output(COM_TYPE_UBX, VAL_LAYER_RAM) &&
+           gnss.setNavigationFrequency(config::kGpsRateHz, VAL_LAYER_RAM) &&
+           gnss.setAutoPVTcallbackPtr(&on_nav_pvt, VAL_LAYER_RAM);
+}
+
+// ---------------------------------------------------------------------------
+// IMU
+// ---------------------------------------------------------------------------
+
+/// Resets the hub and starts its rotation vector.
+bool start(Adafruit_BNO08x& imu)
+{
+    return imu.begin_I2C(config::kImuAddress, &Wire) &&
+           imu.enableReport(SH2_ROTATION_VECTOR, config::kImuReportIntervalUs);
+}
+
+/// Waits up to `timeout` for the hub to pull INT low, which it does while it
+/// has reports waiting.
+bool wait_for_interrupt(std::chrono::milliseconds timeout)
+{
+    const std::uint32_t start = millis();
+    while (digitalRead(config::kImuIntPin) != LOW) {
+        if (millis() - start >= static_cast<std::uint32_t>(timeout.count())) {
+            return false;
+        }
+        rtos::sleep(kPollInterval);
+    }
+    return true;
 }
 
 }  // namespace
 
-void gps_task(neo_m9n::NeoM9n& gps)
+void gps_task()
 {
-    retry(kGpsTag, "Opening the GPS UART", [&] { return gps.open(); });
+    static SFE_UBLOX_GNSS_SERIAL gnss;
 
-    const auto silence_ms = static_cast<std::int32_t>(config::kGpsSilence.count());
+    Serial2.setRxBufferSize(1024);
+    Serial2.begin(config::kGpsBaud, SERIAL_8N1, config::kGpsRxPin, config::kGpsTxPin);
+    retry(kGpsTag, "Looking for the GPS", [] { return gnss.begin(Serial2); });
+
     for (;;) {
         // The configuration lives in the receiver's RAM, so this runs again
         // whenever the receiver goes quiet, in case a power glitch has put it
         // back to its factory NMEA output.
-        retry(kGpsTag, "GPS configuration", [&] { return gps.configure(config::kGpsRateHz); });
+        retry(kGpsTag, "GPS configuration", [] { return configure(gnss); });
         ESP_LOGI(kGpsTag, "GPS up: %u solutions a second", config::kGpsRateHz);
+        g_last_solution_ms = millis();
 
-        for (;;) {
-            const auto solution = gps.read(silence_ms);
-            if (solution) {
-                readings::gps.set(*solution);
-            } else if (solution.error().timed_out()) {
-                ESP_LOGW(kGpsTag, "GPS went quiet, configuring it again");
-                break;
-            } else {
-                ESP_LOGW(kGpsTag, "GPS read failed: %s", solution.error().message());
-            }
+        const auto silence_ms = static_cast<std::uint32_t>(config::kGpsSilence.count());
+        while (millis() - g_last_solution_ms < silence_ms) {
+            // Parse whatever has arrived, then hand complete NAV-PVTs to
+            // on_nav_pvt().
+            gnss.checkUblox();
+            gnss.checkCallbacks();
+            rtos::sleep(kPollInterval);
         }
+        ESP_LOGW(kGpsTag, "GPS went quiet, configuring it again");
     }
 }
 
-void imu_task(bno085::Bno085& imu)
+void imu_task()
 {
-    for (;;) {
-        const bno085::ProductId id = retry(kImuTag, "BNO085 bring-up", [&] { return start(imu); });
-        ESP_LOGI(kImuTag, "BNO085 up: firmware %u.%u.%u, reset cause %s", id.version_major,
-                 id.version_minor, id.version_patch, bno085::to_string(id.reset_cause));
+    // No RST line is wired, so the library resets the hub over I2C.
+    static Adafruit_BNO08x imu;
 
-        // The hub pulls INT low when it has reports waiting; poll() waits for
-        // that and drains the hub.
+    pinMode(config::kImuIntPin, INPUT_PULLUP);
+    Wire.begin(config::kImuSdaPin, config::kImuSclPin, config::kImuI2cHz);
+
+    for (;;) {
+        retry(kImuTag, "BNO085 bring-up", [] { return start(imu); });
+        const sh2_ProductId_t& id = imu.prodIds.entry[0];
+        ESP_LOGI(kImuTag, "BNO085 up: firmware %u.%u.%u, reset cause %u", id.swVersionMajor,
+                 id.swVersionMinor, id.swVersionPatch, id.resetCause);
+        // The reset start() itself caused; only a later one means trouble.
+        imu.wasReset();
+
         for (;;) {
-            if (!imu.poll(rtos::ticks(config::kImuSilence))) {
+            if (!wait_for_interrupt(config::kImuSilence)) {
                 ESP_LOGW(kImuTag, "BNO085 went quiet, starting it again");
                 break;
             }
-            if (const auto orientation = imu.take_orientation()) {
-                readings::imu.set(*orientation);
+
+            // Each getSensorEvent() reads one packet. The hub holds INT low
+            // until everything waiting has been read.
+            for (int reads = 0; reads < kMaxImuReadsPerWake && digitalRead(config::kImuIntPin) == LOW;
+                 ++reads) {
+                sh2_SensorValue_t value{};
+                if (imu.getSensorEvent(&value) && value.sensorId == SH2_ROTATION_VECTOR) {
+                    const sh2_RotationVectorWAcc_t& rv = value.un.rotationVector;
+                    readings::imu.set(Orientation{
+                        .quaternion = {.i = rv.i, .j = rv.j, .k = rv.k, .real = rv.real},
+                        .heading_accuracy_rad = rv.accuracy,
+                        .calibration = static_cast<Accuracy>(value.status & 0x03U),
+                    });
+                }
             }
+
             // A hub that resets on its own stops every report.
-            if (imu.take_reset()) {
+            if (imu.wasReset()) {
                 ESP_LOGW(kImuTag, "BNO085 reset itself, starting it again");
                 break;
             }
@@ -106,21 +223,47 @@ void imu_task(bno085::Bno085& imu)
     }
 }
 
-void lidar_task(tf03::Tf03& lidar)
+void lidar_task()
 {
-    const tf03::FirmwareVersion version =
-        retry(kLidarTag, "Asking the TF03 for its version", [&] { return lidar.firmware_version(); });
-    ESP_LOGI(kLidarTag, "TF03 up: firmware %u.%u.%u", version.major, version.minor, version.patch);
+    static TFMPlus lidar;
+
+    // About a second of frames at the TF03's 100 Hz.
+    Serial1.setRxBufferSize(1024);
+    Serial1.begin(config::kLidarBaud, SERIAL_8N1, config::kLidarRxPin, config::kLidarTxPin);
+    lidar.begin(&Serial1);
+
+    // The TF03 shares the TFMini-Plus's command set and data frame.
+    retry(kLidarTag, "Asking the TF03 for its version",
+          [] { return lidar.sendCommand(GET_FIRMWARE_VERSION, 0); });
+    ESP_LOGI(kLidarTag, "TF03 up: firmware %u.%u.%u", lidar.version[0], lidar.version[1],
+             lidar.version[2]);
 
     for (;;) {
-        const auto measurement = lidar.read();
-        if (measurement) {
-            readings::lidar.set(*measurement);
-        } else {
-            // Typically a receive overflow; the parser resynchronises on the
-            // next frame, so carry on reading.
-            ESP_LOGW(kLidarTag, "TF03 read failed: %s", measurement.error().message());
+        // getData() busy-waits for a frame, so only call it once a whole one
+        // has arrived, and let other tasks run in the meantime.
+        if (Serial1.available() < TFMP_FRAME_SIZE) {
+            rtos::sleep(kPollInterval);
+            continue;
         }
+
+        std::int16_t distance_cm = 0;
+        std::int16_t strength = 0;
+        std::int16_t temperature = 0;
+        if (!lidar.getData(distance_cm, strength, temperature)) {
+            // A checksum mismatch or a lost byte; the next frame resyncs.
+            ESP_LOGW(kLidarTag, "TF03 read failed: status %u", lidar.status);
+            continue;
+        }
+
+        // The TF03 sends kLidarOutOfRangeCm when nothing is in range, and its
+        // returns below kLidarMinStrength are not to be trusted.
+        const auto distance = static_cast<std::uint16_t>(distance_cm);
+        const auto flux = static_cast<std::uint16_t>(strength);
+        const bool usable = distance < config::kLidarOutOfRangeCm && flux >= config::kLidarMinStrength;
+        readings::lidar.set(Range{
+            .distance_cm = usable ? std::optional{distance} : std::nullopt,
+            .strength = flux,
+        });
     }
 }
 

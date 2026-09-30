@@ -11,9 +11,8 @@
 #include <variant>
 
 #include "latest.hpp"
-#include "ping/bno085.hpp"
 #include "ping/geo.hpp"
-#include "ping/neo_m9n.hpp"
+#include "sensors.hpp"
 
 namespace ping {
 
@@ -29,13 +28,13 @@ struct Sighting {
     /// The IMU's estimate of its heading error, degrees.
     float heading_accuracy_deg;
     /// How far the IMU trusts its magnetometer calibration.
-    bno085::Accuracy compass;
+    Accuracy compass;
 };
 
 /// The GPS is running but has no position it vouches for: no fix yet, or
 /// one outside its accuracy limits.
 struct NoFix {
-    neo_m9n::FixType fix_type;
+    FixType fix_type;
     std::uint8_t satellites;
 };
 
