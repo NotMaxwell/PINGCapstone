@@ -24,3 +24,11 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# ESP-IDF (firmware-cpp/)
+firmware-cpp/build/
+firmware-cpp/build-*/
+firmware-cpp/sdkconfig
+firmware-cpp/sdkconfig.old
+firmware-cpp/managed_components/
+firmware-cpp/dependencies.lock
