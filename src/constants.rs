@@ -19,13 +19,13 @@
 //! | NEO-M9N | TXD                 | 16   | J1-9   | UART2 RX         |
 //! | TF03    | brown, TTL_RXD      | 17   | J1-10  | UART1 TX         |
 //! | TF03    | yellow, TTL_TXD     | 18   | J1-11  | UART1 RX         |
-//! | BNO085  | PS0 / WAKE          | 8    | J1-12  | output           |
-//! | BNO085  | NRST                | 9    | J1-15  | output           |
-//! | BNO085  | H_CSN               | 10   | J1-16  | SPI2 CS          |
-//! | BNO085  | SA0 / MOSI          | 11   | J1-17  | SPI2 MOSI        |
-//! | BNO085  | SCK                 | 12   | J1-18  | SPI2 SCK         |
-//! | BNO085  | MISO                | 13   | J1-19  | SPI2 MISO        |
-//! | BNO085  | H_INTN              | 14   | J1-20  | input, pull-up   |
+//! | BNO085  | P0 (PS0 / WAKE)     | 8    | J1-12  | output           |
+//! | BNO085  | RST                 | 9    | J1-15  | output           |
+//! | BNO085  | CS                  | 10   | J1-16  | SPI2 CS          |
+//! | BNO085  | DI (MOSI)           | 11   | J1-17  | SPI2 MOSI        |
+//! | BNO085  | SCL (SCK in SPI)    | 12   | J1-18  | SPI2 SCK         |
+//! | BNO085  | SDA (MISO in SPI)   | 13   | J1-19  | SPI2 MISO        |
+//! | BNO085  | INT                 | 14   | J1-20  | input, pull-up   |
 //! | LCD     | SDA                 | 1    | J3-4   | I2C0 SDA         |
 //! | LCD     | SCL                 | 2    | J3-5   | I2C0 SCL         |
 //!
@@ -37,8 +37,13 @@
 //!
 //! Power: the TF03's red wire takes the fused 12 V line (5–24 V), the board
 //! takes 5.1 V from the buck converter on its 5V pin, and the GPS, IMU and
-//! LCD run from the board's 3V3 pins. The BNO085 needs PS1 tied to 3V3 for
-//! SPI mode.
+//! LCD run from the board's 3V3 pins.
+//!
+//! The BNO085 signal names above are the labels printed on the Adafruit
+//! BNO085 breakout. In SPI mode its SCL pin is the clock and SDA is data out
+//! of the sensor. On that breakout, VIN takes the board's 3V3, P1 ties to the
+//! breakout's own 3Vo pin (P0 and P1 both high selects SPI), and BT stays
+//! unconnected.
 //!
 //! # Using the pins
 //!
@@ -93,29 +98,34 @@ macro_rules! board_pin {
         $p.GPIO18
     };
 
-    // BNO085 IMU on SPI2, its dedicated (IO MUX) pins.
+    // BNO085 IMU on SPI2, its dedicated (IO MUX) pins. Comments name the
+    // Adafruit breakout's printed labels.
+    // Breakout CS.
     ($p:ident . IMU_CS) => {
         $p.GPIO10
     };
+    // Breakout DI: data into the sensor.
     ($p:ident . IMU_MOSI) => {
         $p.GPIO11
     };
+    // Breakout SCL, which is the SPI clock in SPI mode.
     ($p:ident . IMU_SCK) => {
         $p.GPIO12
     };
+    // Breakout SDA, which is data out of the sensor in SPI mode.
     ($p:ident . IMU_MISO) => {
         $p.GPIO13
     };
-    // Active-low data-ready line from the IMU.
+    // Breakout INT: active-low data-ready line.
     ($p:ident . IMU_INT) => {
         $p.GPIO14
     };
-    // Active-low reset.
+    // Breakout RST: active-low reset.
     ($p:ident . IMU_RESET) => {
         $p.GPIO9
     };
-    // PS0/WAKE: held high through reset to select SPI, then pulsed low to
-    // wake the IMU before the board writes to it.
+    // Breakout P0 (PS0/WAKE): held high through reset to select SPI, then
+    // pulsed low to wake the IMU before the board writes to it.
     ($p:ident . IMU_WAKE) => {
         $p.GPIO8
     };
