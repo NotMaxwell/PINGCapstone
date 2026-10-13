@@ -1,6 +1,6 @@
 //! Standalone demo binary for the BNO085 driver.
 //!
-//! Brings up the sensor hub over I2C, starts the rotation vector at 100 Hz and
+//! Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
 //! prints each quaternion over RTT. Kept separate from `main.rs` so the
 //! application entry point stays clear of sensor bring-up code.
 
@@ -16,15 +16,15 @@
 use embassy_executor::Spawner;
 use embassy_time::{Delay, Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Pull};
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::spi::Mode as SpiMode;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use ping_capstone::bno085::{Address, Bno085};
+use ping_capstone::bno085::{Bno085, SpiTransport};
+use ping_capstone::constants::{HEAP_SIZE, IMU_SPI_FREQUENCY_KHZ};
+use ping_capstone::{board_bus, board_pin};
 use rtt_target::rprintln;
-
-/// Ask for a rotation vector every 10 ms, i.e. 100 Hz.
-const IMU_REPORT_INTERVAL_US: u32 = 10_000;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -49,7 +49,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -62,24 +62,45 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::wifi::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    // Adjust these pins to match how the BNO085 breakout is wired: SDA on
-    // GPIO8, SCL on GPIO9, and the sensor's INT line on GPIO10. INT is open
+    // Pins come from ping_capstone::constants. The BNO085 runs in SPI mode
+    // 3: PS1 is tied to 3V3 on the board, and WAKE (PS0) starts high so the
+    // hub selects SPI when the driver releases its reset line. INT is open
     // drain and active low, so it needs a pull-up.
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    let spi = Spi::new(
+        board_bus!(peripherals.IMU_SPI),
+        SpiConfig::default()
+            .with_frequency(Rate::from_khz(IMU_SPI_FREQUENCY_KHZ))
+            .with_mode(SpiMode::_3),
     )
-    .expect("Failed to configure I2C")
-    .with_sda(peripherals.GPIO8)
-    .with_scl(peripherals.GPIO9)
+    .expect("Failed to configure SPI")
+    .with_sck(board_pin!(peripherals.IMU_SCK))
+    .with_mosi(board_pin!(peripherals.IMU_MOSI))
+    .with_miso(board_pin!(peripherals.IMU_MISO))
     .into_async();
-
-    let imu_int = Input::new(peripherals.GPIO10, InputConfig::default().with_pull(Pull::Up));
-
-    spawner.spawn(
-        imu_task(Bno085::new(i2c, Address::Default, Delay), imu_int)
-            .expect("Failed to spawn the IMU task"),
+    let transport = SpiTransport::new(
+        spi,
+        Output::new(
+            board_pin!(peripherals.IMU_CS),
+            Level::High,
+            OutputConfig::default(),
+        ),
+        Input::new(
+            board_pin!(peripherals.IMU_INT),
+            InputConfig::default().with_pull(Pull::Up),
+        ),
+        Output::new(
+            board_pin!(peripherals.IMU_WAKE),
+            Level::High,
+            OutputConfig::default(),
+        ),
+        Output::new(
+            board_pin!(peripherals.IMU_RESET),
+            Level::High,
+            OutputConfig::default(),
+        ),
     );
+
+    spawner.spawn(imu_task(Bno085::new(transport, Delay)).expect("Failed to spawn the IMU task"));
 
     loop {
         rprintln!("Hello world!");
@@ -93,17 +114,28 @@ mod imu {
     //! The IMU task lives in its own module so that the stack frame lint can
     //! be relaxed for it. An embassy task's future is allocated once in a
     //! static task pool rather than on the stack, and most of its size here
-    //! is the HAL's I2C futures and the formatting machinery behind
+    //! is the HAL's SPI futures and the formatting machinery behind
     //! rprintln!, not anything this code puts on the stack.
     #![allow(clippy::large_stack_frames)]
 
-    use super::IMU_REPORT_INTERVAL_US;
-    use embassy_time::{Delay, Duration, Timer};
+    use embassy_time::{Delay, Timer};
     use esp_hal::Async;
-    use esp_hal::gpio::Input;
-    use esp_hal::i2c::master::I2c;
-    use ping_capstone::bno085::{Bno085, SensorData, SensorId};
+    use esp_hal::gpio::{Input, Output};
+    use esp_hal::spi::master::Spi;
+    use ping_capstone::bno085::{Bno085, SensorData, SensorId, SpiTransport};
+    use ping_capstone::constants::{IMU_REPORT_INTERVAL_US, RETRY_DELAY};
     use rtt_target::rprintln;
+
+    type Imu = Bno085<
+        SpiTransport<
+            Spi<'static, Async>,
+            Output<'static>,
+            Input<'static>,
+            Output<'static>,
+            Output<'static>,
+        >,
+        Delay,
+    >;
 
     /// Reads orientation from the BNO085.
     ///
@@ -111,7 +143,7 @@ mod imu {
     /// until everything waiting has been read, so each wake-up drains the hub
     /// before going back to sleep.
     #[embassy_executor::task]
-    pub async fn imu_task(mut imu: Bno085<I2c<'static, Async>, Delay>, mut int: Input<'static>) {
+    pub async fn imu_task(mut imu: Imu) {
         loop {
             match imu.init().await {
                 Ok(id) => {
@@ -126,7 +158,7 @@ mod imu {
                 }
                 Err(error) => {
                     rprintln!("BNO085 init failed: {:?}, retrying", error);
-                    Timer::after(Duration::from_secs(1)).await;
+                    Timer::after(RETRY_DELAY).await;
                 }
             }
         }
@@ -140,7 +172,11 @@ mod imu {
         }
 
         loop {
-            int.wait_for_low().await;
+            if let Err(error) = imu.wait_for_data().await {
+                rprintln!("BNO085 wait failed: {:?}", error);
+                Timer::after(RETRY_DELAY).await;
+                continue;
+            }
 
             loop {
                 match imu.read_event().await {

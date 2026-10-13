@@ -1,28 +1,29 @@
-//! Async I²C driver for the CEVA/Hillcrest BNO085 nine axis sensor hub.
+//! Async driver for the CEVA/Hillcrest BNO085 nine axis sensor hub, over SPI
+//! or I²C.
 //!
 //! The BNO085 is not a register mapped IMU. It runs SH-2 sensor fusion
 //! firmware on its own microcontroller and speaks a packet protocol: you ask
 //! it to start producing a *report* at some rate, and it pushes reports at you
-//! until told otherwise. This module implements that protocol on top of any
-//! [`embedded_hal_async::i2c::I2c`] bus.
+//! until told otherwise. This module implements that protocol on top of a
+//! [`Transport`]: [`SpiTransport`] or [`I2cTransport`].
 //!
 //! # Interrupt pin
 //!
-//! The hub drives its `INT` line low when it has a packet waiting. Reading
-//! when nothing is pending is harmless — [`Bno085::read_event`] returns
-//! `Ok(None)` — but polling wastes bus bandwidth and, on some boards, reads
-//! while the hub is asleep are unreliable. Wire `INT` up and await a falling
-//! edge before each read.
+//! The hub drives its `INT` line low when it has a packet waiting. Both
+//! transports own that pin, and [`Bno085::wait_for_data`] waits on it.
+//! Reading when nothing is pending is harmless — [`Bno085::read_event`]
+//! returns `Ok(None)`.
 //!
 //! # Example
 //!
 //! ```ignore
-//! let mut imu = Bno085::new(i2c, Address::Default, Delay);
+//! let transport = SpiTransport::new(spi, cs, int, wake, reset);
+//! let mut imu = Bno085::new(transport, Delay);
 //! let id = imu.init().await?;
 //! imu.enable_report(SensorId::RotationVector, 10_000).await?; // 100 Hz
 //!
 //! loop {
-//!     int_pin.wait_for_falling_edge().await;
+//!     imu.wait_for_data().await?;
 //!     while let Some(event) = imu.read_event().await? {
 //!         if let SensorData::RotationVector { quaternion, .. } = event.data {
 //!             // ...
@@ -33,12 +34,13 @@
 
 pub mod reports;
 pub mod shtp;
+pub mod transport;
 
 use embedded_hal_async::delay::DelayNs;
-use embedded_hal_async::i2c::I2c;
 
 pub use reports::{Accuracy, Event, Quaternion, RawVec3, SensorData, SensorId, Vec3};
 use shtp::{Channel, HEADER_LEN, Header};
+pub use transport::{I2cError, I2cTransport, SpiError, SpiTransport, Transport};
 
 /// Largest cargo the driver will buffer.
 ///
@@ -46,12 +48,12 @@ use shtp::{Channel, HEADER_LEN, Header};
 /// due at once, so tens of bytes in normal use and a few hundred only under
 /// aggressive batching. The reset advertisement is the one genuinely large
 /// packet the hub sends, and that is discarded rather than parsed.
-const MAX_CARGO: usize = 256;
+pub const MAX_CARGO: usize = 256;
 
-/// Largest single I²C transfer the driver will attempt.
+/// Largest single bus transfer the transports will attempt.
 ///
-/// Cargos longer than this are read in several transactions, each of which
-/// the hub prefixes with a fresh four byte header.
+/// On I²C, cargos longer than this are read in several transactions, each of
+/// which the hub prefixes with a fresh four byte header.
 const MAX_TRANSFER: usize = 64;
 
 /// Enough for the longest command this driver sends (set feature, 17 bytes)
@@ -107,8 +109,8 @@ pub enum Address {
 /// What the driver can fail at.
 #[derive(Debug)]
 pub enum Error<E> {
-    /// The underlying I²C bus returned an error.
-    I2c(E),
+    /// The bus or a control pin underneath the transport returned an error.
+    Bus(E),
     /// A cargo arrived that is larger than [`MAX_CARGO`]. It has been read and
     /// discarded so the bus stays in sync; nothing else is wrong.
     CargoTooLarge(u16),
@@ -227,10 +229,9 @@ impl ReportConfig {
     }
 }
 
-/// A BNO085 on an async I²C bus.
-pub struct Bno085<I2C, D> {
-    i2c: I2C,
-    address: u8,
+/// A BNO085 on any [`Transport`].
+pub struct Bno085<T, D> {
+    transport: T,
     delay: D,
     /// SHTP sequence numbers, one per channel.
     sequence: [u8; 6],
@@ -238,9 +239,6 @@ pub struct Bno085<I2C, D> {
     command_sequence: u8,
     /// The cargo most recently read, header included.
     buf: [u8; MAX_CARGO],
-    /// Landing area for one I²C transfer. Kept here rather than on the stack
-    /// so it does not inflate the future of every call that reads.
-    scratch: [u8; MAX_TRANSFER],
     /// Length of that cargo, or zero when the buffer holds nothing.
     cargo_len: usize,
     /// How far through the buffered cargo [`Bno085::read_event`] has walked.
@@ -252,21 +250,19 @@ pub struct Bno085<I2C, D> {
     reference_delta: i32,
 }
 
-impl<I2C, D> Bno085<I2C, D>
+impl<T, D> Bno085<T, D>
 where
-    I2C: I2c,
+    T: Transport,
     D: DelayNs,
 {
-    /// Wraps an I²C bus. Nothing is sent until [`Bno085::init`] is called.
-    pub fn new(i2c: I2C, address: Address, delay: D) -> Self {
+    /// Wraps a transport. Nothing is sent until [`Bno085::init`] is called.
+    pub fn new(transport: T, delay: D) -> Self {
         Self {
-            i2c,
-            address: address as u8,
+            transport,
             delay,
             sequence: [0; 6],
             command_sequence: 0,
             buf: [0; MAX_CARGO],
-            scratch: [0; MAX_TRANSFER],
             cargo_len: 0,
             cursor: 0,
             channel: 0,
@@ -276,9 +272,11 @@ where
 
     /// Resets the hub and reads back its identification.
     ///
-    /// No reports are enabled by a reset, so follow this with
+    /// Uses the transport's hardware reset where it has one, then a soft
+    /// reset. No reports are enabled by a reset, so follow this with
     /// [`Bno085::enable_report`] for each sensor you want.
-    pub async fn init(&mut self) -> Result<ProductId, Error<I2C::Error>> {
+    pub async fn init(&mut self) -> Result<ProductId, Error<T::Error>> {
+        self.transport.reset().await?;
         self.soft_reset().await?;
         self.product_id().await
     }
@@ -288,7 +286,7 @@ where
     /// The hub sends an advertisement packet on its way up. That packet is
     /// larger than the driver's buffer and describes only things the driver
     /// already knows, so it is read and discarded.
-    pub async fn soft_reset(&mut self) -> Result<(), Error<I2C::Error>> {
+    pub async fn soft_reset(&mut self) -> Result<(), Error<T::Error>> {
         self.write_cargo(Channel::Executable, &[EXECUTABLE_RESET])
             .await?;
         self.delay.delay_ms(BOOT_DELAY_MS).await;
@@ -331,7 +329,7 @@ where
     }
 
     /// Asks the hub what it is and which reset it last went through.
-    pub async fn product_id(&mut self) -> Result<ProductId, Error<I2C::Error>> {
+    pub async fn product_id(&mut self) -> Result<ProductId, Error<T::Error>> {
         self.write_cargo(Channel::Control, &[REPORT_PRODUCT_ID_REQUEST, 0])
             .await?;
 
@@ -359,19 +357,19 @@ where
         &mut self,
         sensor: SensorId,
         interval_us: u32,
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<T::Error>> {
         self.set_feature(&ReportConfig::new(sensor, interval_us))
             .await
     }
 
     /// Stops a sensor reporting.
-    pub async fn disable_report(&mut self, sensor: SensorId) -> Result<(), Error<I2C::Error>> {
+    pub async fn disable_report(&mut self, sensor: SensorId) -> Result<(), Error<T::Error>> {
         self.set_feature(&ReportConfig::new(sensor, 0)).await
     }
 
     /// Configures a report in full, for the cases [`Bno085::enable_report`]
     /// does not cover.
-    pub async fn set_feature(&mut self, config: &ReportConfig) -> Result<(), Error<I2C::Error>> {
+    pub async fn set_feature(&mut self, config: &ReportConfig) -> Result<(), Error<T::Error>> {
         let mut payload = [0u8; 17];
         payload[0] = REPORT_SET_FEATURE_COMMAND;
         payload[1] = config.sensor as u8;
@@ -389,7 +387,7 @@ where
     /// One packet often carries several reports, so call this in a loop until
     /// it returns `Ok(None)` before going back to waiting on the `INT` pin.
     /// Packets that are not sensor reports are consumed and skipped.
-    pub async fn read_event(&mut self) -> Result<Option<Event>, Error<I2C::Error>> {
+    pub async fn read_event(&mut self) -> Result<Option<Event>, Error<T::Error>> {
         loop {
             if let Some(event) = self.next_buffered_event() {
                 return Ok(Some(event));
@@ -410,13 +408,16 @@ where
     /// becomes the reference the chosen output reports against.
     ///
     /// The tare is lost on reset unless [`Bno085::persist_tare`] follows.
-    pub async fn tare(&mut self, axes: u8, basis: TareBasis) -> Result<(), Error<I2C::Error>> {
-        self.send_command(COMMAND_TARE, &[TARE_NOW, axes, basis as u8, 0, 0, 0, 0, 0, 0])
-            .await
+    pub async fn tare(&mut self, axes: u8, basis: TareBasis) -> Result<(), Error<T::Error>> {
+        self.send_command(
+            COMMAND_TARE,
+            &[TARE_NOW, axes, basis as u8, 0, 0, 0, 0, 0, 0],
+        )
+        .await
     }
 
     /// Writes the current tare to flash so it survives a reset.
-    pub async fn persist_tare(&mut self) -> Result<(), Error<I2C::Error>> {
+    pub async fn persist_tare(&mut self) -> Result<(), Error<T::Error>> {
         self.send_command(COMMAND_TARE, &[TARE_PERSIST, 0, 0, 0, 0, 0, 0, 0, 0])
             .await
     }
@@ -430,7 +431,7 @@ where
         accelerometer: bool,
         gyroscope: bool,
         magnetometer: bool,
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<T::Error>> {
         self.send_command(
             COMMAND_ME_CALIBRATE,
             &[
@@ -452,7 +453,7 @@ where
     ///
     /// Worth doing once the hub reports [`Accuracy::High`], so the next boot
     /// starts from a good calibration instead of relearning it.
-    pub async fn save_calibration(&mut self) -> Result<(), Error<I2C::Error>> {
+    pub async fn save_calibration(&mut self) -> Result<(), Error<T::Error>> {
         self.send_command(COMMAND_SAVE_DCD, &[0; 9]).await
     }
 
@@ -462,7 +463,7 @@ where
         &mut self,
         command: u8,
         params: &[u8; 9],
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<T::Error>> {
         let mut payload = [0u8; 12];
         payload[0] = REPORT_COMMAND_REQUEST;
         payload[1] = self.command_sequence;
@@ -473,9 +474,15 @@ where
         self.write_cargo(Channel::Control, &payload).await
     }
 
-    /// Gives the I²C bus back.
-    pub fn release(self) -> I2C {
-        self.i2c
+    /// Waits until the hub has data waiting, then returns. Follow it with
+    /// [`Bno085::read_event`] in a loop until that returns `Ok(None)`.
+    pub async fn wait_for_data(&mut self) -> Result<(), Error<T::Error>> {
+        self.transport.wait_for_data().await
+    }
+
+    /// Gives the transport back.
+    pub fn release(self) -> T {
+        self.transport
     }
 
     /// Pulls the next report out of the buffered cargo, if there is one left.
@@ -560,83 +567,9 @@ where
 
     /// Reads whatever cargo the hub has waiting into `self.buf`.
     ///
-    /// Returns `Ok(None)` when the hub has nothing to send. Every read
-    /// transaction comes back with a four byte header in front of it, so a
-    /// four byte read peeks the length without consuming any payload, and
-    /// each chunk after the first has a header to skip.
-    async fn read_cargo(&mut self) -> Result<Option<Header>, Error<I2C::Error>> {
-        let mut head = [0u8; HEADER_LEN];
-        self.i2c
-            .read(self.address, &mut head)
-            .await
-            .map_err(Error::I2c)?;
-
-        let Some(header) = Header::parse(head) else {
-            return Ok(None);
-        };
-
-        let total = header.cargo_len as usize;
-        if total > MAX_CARGO {
-            self.discard_cargo(total).await?;
-            return Err(Error::CargoTooLarge(header.cargo_len));
-        }
-
-        let mut remaining = total;
-        let mut written = 0;
-        let mut first = true;
-
-        while remaining > 0 {
-            let want = if first {
-                remaining.min(MAX_TRANSFER)
-            } else {
-                (remaining + HEADER_LEN).min(MAX_TRANSFER)
-            };
-
-            self.i2c
-                .read(self.address, &mut self.scratch[..want])
-                .await
-                .map_err(Error::I2c)?;
-
-            // The first chunk's header is the cargo's own; later chunks
-            // carry a repeat of it that is not part of the payload.
-            let chunk = if first {
-                &self.scratch[..want]
-            } else {
-                &self.scratch[HEADER_LEN..want]
-            };
-
-            self.buf[written..written + chunk.len()].copy_from_slice(chunk);
-            written += chunk.len();
-            remaining -= chunk.len();
-            first = false;
-        }
-
-        Ok(Some(header))
-    }
-
-    /// Reads a cargo the driver has no room for and throws it away, so the
-    /// hub moves on to the next one.
-    async fn discard_cargo(&mut self, total: usize) -> Result<(), Error<I2C::Error>> {
-        let mut remaining = total;
-        let mut first = true;
-
-        while remaining > 0 {
-            let want = if first {
-                remaining.min(MAX_TRANSFER)
-            } else {
-                (remaining + HEADER_LEN).min(MAX_TRANSFER)
-            };
-
-            self.i2c
-                .read(self.address, &mut self.scratch[..want])
-                .await
-                .map_err(Error::I2c)?;
-
-            remaining -= if first { want } else { want - HEADER_LEN };
-            first = false;
-        }
-
-        Ok(())
+    /// Returns `Ok(None)` when the hub has nothing to send.
+    async fn read_cargo(&mut self) -> Result<Option<Header>, Error<T::Error>> {
+        self.transport.read_cargo(&mut self.buf).await
     }
 
     /// Waits for a particular report to arrive on the control channel,
@@ -646,7 +579,7 @@ where
         &mut self,
         report_id: u8,
         min_len: usize,
-    ) -> Result<usize, Error<I2C::Error>> {
+    ) -> Result<usize, Error<T::Error>> {
         let mut waited = 0;
 
         loop {
@@ -678,7 +611,7 @@ where
         &mut self,
         channel: Channel,
         payload: &[u8],
-    ) -> Result<(), Error<I2C::Error>> {
+    ) -> Result<(), Error<T::Error>> {
         debug_assert!(payload.len() + HEADER_LEN <= MAX_WRITE);
 
         let sequence = &mut self.sequence[channel as usize];
@@ -689,9 +622,8 @@ where
         frame[..HEADER_LEN].copy_from_slice(&header);
         frame[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
 
-        self.i2c
-            .write(self.address, &frame[..HEADER_LEN + payload.len()])
+        self.transport
+            .write_cargo(&frame[..HEADER_LEN + payload.len()])
             .await
-            .map_err(Error::I2c)
     }
 }

@@ -20,7 +20,9 @@ use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
+use ping_capstone::constants::{HEAP_SIZE, LIDAR_BAUD_RATE};
 use ping_capstone::tf03::Tf03;
+use ping_capstone::{board_bus, board_pin};
 use rtt_target::rprintln;
 
 /// The TF03 streams 100 measurements a second by default; print one in ten.
@@ -49,7 +51,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -62,15 +64,18 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::wifi::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    // Adjust these pins to match how the TF03 is wired. Its UART is 3.3 V, so
-    // it connects directly: GPIO17 (TX) to the TF03's blue RxD wire, GPIO18
-    // (RX) to its brown TxD wire, and the grounds together. The red supply
-    // wire needs 5-24 V, not the 3.3 V rail.
-    let uart = Uart::new(peripherals.UART1, UartConfig::default().with_baudrate(115_200))
-        .expect("Failed to configure UART")
-        .with_tx(peripherals.GPIO17)
-        .with_rx(peripherals.GPIO18)
-        .into_async();
+    // Pins come from ping_capstone::constants. The TF03's UART is 3.3 V, so
+    // it connects directly: board TX to the brown TTL_RXD wire, board RX to
+    // the yellow TTL_TXD wire, and the grounds together. The red supply wire
+    // takes 5-24 V; on PING it runs from the fused 12 V line.
+    let uart = Uart::new(
+        board_bus!(peripherals.LIDAR_UART),
+        UartConfig::default().with_baudrate(LIDAR_BAUD_RATE),
+    )
+    .expect("Failed to configure UART")
+    .with_tx(board_pin!(peripherals.LIDAR_TX))
+    .with_rx(board_pin!(peripherals.LIDAR_RX))
+    .into_async();
 
     spawner.spawn(lidar_task(Tf03::new(uart)).expect("Failed to spawn the LiDAR task"));
 
@@ -91,9 +96,10 @@ mod lidar {
     #![allow(clippy::large_stack_frames)]
 
     use super::PRINT_EVERY;
-    use embassy_time::{Duration, Timer};
+    use embassy_time::Timer;
     use esp_hal::Async;
     use esp_hal::uart::Uart;
+    use ping_capstone::constants::RETRY_DELAY;
     use ping_capstone::tf03::Tf03;
     use rtt_target::rprintln;
 
@@ -113,7 +119,7 @@ mod lidar {
                 }
                 Err(error) => {
                     rprintln!("TF03 not answering: {:?}, retrying", error);
-                    Timer::after(Duration::from_secs(1)).await;
+                    Timer::after(RETRY_DELAY).await;
                 }
             }
         }
