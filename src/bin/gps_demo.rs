@@ -22,11 +22,10 @@ use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
-use ping_capstone::neo_m9n::{DEFAULT_BAUD_RATE, NeoM9n};
+use ping_capstone::constants::{GPS_BAUD_RATE, HEAP_SIZE};
+use ping_capstone::neo_m9n::NeoM9n;
+use ping_capstone::{board_bus, board_pin};
 use rtt_target::rprintln;
-
-/// Ask for a navigation solution ten times a second.
-const NAV_RATE_HZ: u8 = 10;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -51,7 +50,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -64,17 +63,16 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::wifi::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    // Adjust these pins to match how the NEO-M9N is wired. The SparkFun board
-    // is 3.3 V throughout, so it connects directly: GPIO15 (TX) to the
-    // board's RX1 pin, GPIO16 (RX) to its TX1 pin, and the grounds together.
-    // UART2 leaves UART1 free for the TF03.
+    // Pins come from ping_capstone::constants. The NEO-M9N runs at 3.3 V, so
+    // it connects directly: board TX to the GPS's RXD, board RX to its TXD,
+    // and the grounds together. UART2 leaves UART1 free for the TF03.
     let uart = Uart::new(
-        peripherals.UART2,
-        UartConfig::default().with_baudrate(DEFAULT_BAUD_RATE),
+        board_bus!(peripherals.GPS_UART),
+        UartConfig::default().with_baudrate(GPS_BAUD_RATE),
     )
     .expect("Failed to configure UART")
-    .with_tx(peripherals.GPIO15)
-    .with_rx(peripherals.GPIO16)
+    .with_tx(board_pin!(peripherals.GPS_TX))
+    .with_rx(board_pin!(peripherals.GPS_RX))
     .into_async();
 
     spawner.spawn(gps_task(NeoM9n::new(uart)).expect("Failed to spawn the GPS task"));
@@ -96,10 +94,10 @@ mod gps {
     //! the stack.
     #![allow(clippy::large_stack_frames)]
 
-    use super::NAV_RATE_HZ;
-    use embassy_time::{Duration, Timer};
+    use embassy_time::Timer;
     use esp_hal::Async;
     use esp_hal::uart::Uart;
+    use ping_capstone::constants::{GPS_RATE_HZ, RETRY_DELAY};
     use ping_capstone::neo_m9n::NeoM9n;
     use rtt_target::rprintln;
 
@@ -122,14 +120,14 @@ mod gps {
                 }
                 Err(error) => {
                     rprintln!("GPS not answering: {:?}, retrying", error);
-                    Timer::after(Duration::from_secs(1)).await;
+                    Timer::after(RETRY_DELAY).await;
                 }
             }
         }
 
-        while let Err(error) = gps.configure(NAV_RATE_HZ).await {
+        while let Err(error) = gps.configure(GPS_RATE_HZ).await {
             rprintln!("GPS refused configuration: {:?}, retrying", error);
-            Timer::after(Duration::from_secs(1)).await;
+            Timer::after(RETRY_DELAY).await;
         }
 
         loop {

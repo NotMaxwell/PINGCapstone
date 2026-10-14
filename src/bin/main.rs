@@ -18,7 +18,8 @@
 //!
 //! Before trusting the bearings, set [`LIDAR_BORESIGHT`] to how the LiDAR is
 //! mounted against the IMU and [`MAGNETIC_DECLINATION_DEG`] to where the
-//! device is used.
+//! device is used. Both live in [`ping_capstone::constants`], with the pin map
+//! and every other fixed setting.
 
 #![no_std]
 #![no_main]
@@ -39,65 +40,23 @@ use embassy_time::{Delay, Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Write;
 use esp_hal::Async;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Pull};
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::spi::Mode as SpiMode;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_hal::usb_serial_jtag::UsbSerialJtag;
-use ping_capstone::bno085::{Accuracy, Address, Bno085, Quaternion, Vec3};
-use ping_capstone::geo::{Aim, Position};
-use ping_capstone::neo_m9n::{self, FixType, NeoM9n, Solution};
-use ping_capstone::tf03::{Measurement, Tf03};
-use rtt_target::rprintln;
-
-/// How many positions a second the GPS computes.
-const GPS_RATE_HZ: u8 = 10;
-
-/// How often the IMU reports its orientation: every 10 ms, i.e. 100 Hz.
-const IMU_REPORT_INTERVAL_US: u32 = 10_000;
-
-/// The direction the LiDAR looks, in the IMU's frame: the axes printed on the
-/// BNO085 breakout. Set this to match how the two are mounted. The default is
-/// +Y because that is where the BNO085 itself points: lying level with +Y
-/// towards magnetic north, it reports no rotation at all.
-const LIDAR_BORESIGHT: Vec3 = Vec3 {
-    x: 0.0,
-    y: 1.0,
-    z: 0.0,
+use ping_capstone::bno085::{Accuracy, Bno085, Quaternion, SpiTransport};
+use ping_capstone::constants::{
+    DEBOUNCE, GPS_BAUD_RATE, HEAP_SIZE, IMU_SPI_FREQUENCY_KHZ, LIDAR_BAUD_RATE, LIDAR_BORESIGHT,
+    MAGNETIC_DECLINATION_DEG, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, SERIAL_TIMEOUT,
 };
-
-/// How far magnetic north lies east of true north where the device is used,
-/// in degrees, negative for west. The IMU measures bearings from magnetic
-/// north, but coordinates are laid out from true north. Look the value up at
-/// <https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml>.
-const MAGNETIC_DECLINATION_DEG: f32 = 0.0;
-
-// Readings older than these when the button is pressed are not used. The GPS
-// allowance covers a few missed solutions; the IMU and LiDAR report 100 times
-// a second, so a quarter of a second without a report means something is
-// wrong.
-const MAX_GPS_AGE: Duration = Duration::from_secs(2);
-const MAX_IMU_AGE: Duration = Duration::from_millis(250);
-const MAX_LIDAR_AGE: Duration = Duration::from_millis(250);
-
-/// A GPS this long without a solution has probably lost power, and with it
-/// its configuration, which lives in RAM. The GPS task then configures it
-/// again.
-const GPS_SILENCE: Duration = Duration::from_secs(3);
-
-/// An IMU this long without a report has probably reset, which stops every
-/// report. The IMU task then starts it again.
-const IMU_SILENCE: Duration = Duration::from_secs(1);
-
-/// How long the button has to stay down to count as pressed, or up to count
-/// as released: longer than a switch's contact bounce, shorter than a tap.
-const DEBOUNCE: Duration = Duration::from_millis(30);
-
-/// How long a line may take to leave over the USB serial port. The port only
-/// drains while a computer reads it, so with nothing at the other end a write
-/// would otherwise wait forever.
-const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
+use ping_capstone::geo::{Aim, Position};
+use ping_capstone::neo_m9n::{FixType, NeoM9n, Solution};
+use ping_capstone::tf03::{Measurement, Tf03};
+use ping_capstone::{board_bus, board_pin};
+use rtt_target::rprintln;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -122,7 +81,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: HEAP_SIZE);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -136,50 +95,71 @@ async fn main(spawner: Spawner) -> ! {
         esp_radio::wifi::new(peripherals.WIFI, Default::default())
             .expect("Failed to initialize Wi-Fi controller");
 
-    // The sensors are wired as in their demo binaries, which say more.
-    //
-    // GPS: GPIO15 (TX) to the NEO-M9N board's RX1, GPIO16 (RX) to its TX1.
+    // Every pin and bus below comes from ping_capstone::constants, which
+    // holds the pin map and the reasoning behind it.
+
+    // GPS: board TX to the NEO-M9N's RXD, board RX to its TXD.
     let gps_uart = Uart::new(
-        peripherals.UART2,
-        UartConfig::default().with_baudrate(neo_m9n::DEFAULT_BAUD_RATE),
+        board_bus!(peripherals.GPS_UART),
+        UartConfig::default().with_baudrate(GPS_BAUD_RATE),
     )
     .expect("Failed to configure the GPS UART")
-    .with_tx(peripherals.GPIO15)
-    .with_rx(peripherals.GPIO16)
+    .with_tx(board_pin!(peripherals.GPS_TX))
+    .with_rx(board_pin!(peripherals.GPS_RX))
     .into_async();
 
-    // IMU: SDA on GPIO8, SCL on GPIO9, and the BNO085's INT line on GPIO10.
+    // IMU: SPI mode 3. WAKE (PS0) starts high so the hub comes up in SPI mode
+    // when the driver releases its reset line; chip select starts high, idle.
     // INT is open drain and active low, so it needs a pull-up.
-    let imu_i2c = I2c::new(
-        peripherals.I2C0,
-        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    let imu_spi = Spi::new(
+        board_bus!(peripherals.IMU_SPI),
+        SpiConfig::default()
+            .with_frequency(Rate::from_khz(IMU_SPI_FREQUENCY_KHZ))
+            .with_mode(SpiMode::_3),
     )
-    .expect("Failed to configure the IMU I2C bus")
-    .with_sda(peripherals.GPIO8)
-    .with_scl(peripherals.GPIO9)
+    .expect("Failed to configure the IMU SPI bus")
+    .with_sck(board_pin!(peripherals.IMU_SCK))
+    .with_mosi(board_pin!(peripherals.IMU_MOSI))
+    .with_miso(board_pin!(peripherals.IMU_MISO))
     .into_async();
-    let imu_int = Input::new(
-        peripherals.GPIO10,
-        InputConfig::default().with_pull(Pull::Up),
+    let imu = SpiTransport::new(
+        imu_spi,
+        Output::new(
+            board_pin!(peripherals.IMU_CS),
+            Level::High,
+            OutputConfig::default(),
+        ),
+        Input::new(
+            board_pin!(peripherals.IMU_INT),
+            InputConfig::default().with_pull(Pull::Up),
+        ),
+        Output::new(
+            board_pin!(peripherals.IMU_WAKE),
+            Level::High,
+            OutputConfig::default(),
+        ),
+        Output::new(
+            board_pin!(peripherals.IMU_RESET),
+            Level::High,
+            OutputConfig::default(),
+        ),
     );
 
-    // LiDAR: GPIO17 (TX) to the TF03's blue RxD wire, GPIO18 (RX) to its
-    // brown TxD wire.
+    // LiDAR: board TX to the TF03's brown TTL_RXD wire, board RX to its
+    // yellow TTL_TXD wire.
     let lidar_uart = Uart::new(
-        peripherals.UART1,
-        UartConfig::default().with_baudrate(115_200),
+        board_bus!(peripherals.LIDAR_UART),
+        UartConfig::default().with_baudrate(LIDAR_BAUD_RATE),
     )
     .expect("Failed to configure the LiDAR UART")
-    .with_tx(peripherals.GPIO17)
-    .with_rx(peripherals.GPIO18)
+    .with_tx(board_pin!(peripherals.LIDAR_TX))
+    .with_rx(board_pin!(peripherals.LIDAR_RX))
     .into_async();
 
-    // GPIO0 is the BOOT button on most ESP32-S3 boards, so this works with
-    // nothing wired up. For a button of your own, wire it from a free GPIO to
-    // ground and change the pin here. Holding GPIO0 down while the board
-    // resets starts the ROM bootloader instead of this program.
+    // Trigger button, wired from its GPIO to ground. GPIO0 (BOOT) is avoided
+    // because holding it during a reset starts the ROM bootloader.
     let mut button = Input::new(
-        peripherals.GPIO0,
+        board_pin!(peripherals.BUTTON),
         InputConfig::default().with_pull(Pull::Up),
     );
 
@@ -188,10 +168,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut serial = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
 
     spawner.spawn(gps_task(NeoM9n::new(gps_uart)).expect("Failed to spawn the GPS task"));
-    spawner.spawn(
-        imu_task(Bno085::new(imu_i2c, Address::Default, Delay), imu_int)
-            .expect("Failed to spawn the IMU task"),
-    );
+    spawner.spawn(imu_task(Bno085::new(imu, Delay)).expect("Failed to spawn the IMU task"));
     spawner.spawn(lidar_task(Tf03::new(lidar_uart)).expect("Failed to spawn the LiDAR task"));
 
     let mut presses: u32 = 0;
@@ -419,21 +396,31 @@ mod sensors {
     //! on the stack.
     #![allow(clippy::large_stack_frames)]
 
-    use super::{
-        GPS, GPS_RATE_HZ, GPS_SILENCE, IMU, IMU_REPORT_INTERVAL_US, IMU_SILENCE, LIDAR, Orientation,
-    };
-    use embassy_time::{Delay, Duration, Timer, with_timeout};
+    use super::{GPS, IMU, LIDAR, Orientation};
+    use core::convert::Infallible;
+    use embassy_time::{Delay, Timer, with_timeout};
     use esp_hal::Async;
-    use esp_hal::gpio::Input;
-    use esp_hal::i2c;
-    use esp_hal::i2c::master::I2c;
+    use esp_hal::gpio::{Input, Output};
+    use esp_hal::spi;
+    use esp_hal::spi::master::Spi;
     use esp_hal::uart::Uart;
-    use ping_capstone::bno085::{self, Bno085, ProductId, SensorData, SensorId};
+    use ping_capstone::bno085::{self, Bno085, ProductId, SensorData, SensorId, SpiTransport};
+    use ping_capstone::constants::{
+        GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE, RETRY_DELAY,
+    };
     use ping_capstone::neo_m9n::NeoM9n;
     use ping_capstone::tf03::Tf03;
     use rtt_target::rprintln;
 
-    type Imu = Bno085<I2c<'static, Async>, Delay>;
+    type ImuTransport = SpiTransport<
+        Spi<'static, Async>,
+        Output<'static>,
+        Input<'static>,
+        Output<'static>,
+        Output<'static>,
+    >;
+    type Imu = Bno085<ImuTransport, Delay>;
+    type ImuError = bno085::Error<bno085::SpiError<spi::Error, Infallible>>;
 
     /// Keeps the latest navigation solution from the NEO-M9N.
     #[embassy_executor::task]
@@ -444,7 +431,7 @@ mod sensors {
             // has put it back to its factory NMEA output.
             while let Err(error) = gps.configure(GPS_RATE_HZ).await {
                 rprintln!("GPS configuration failed: {:?}, retrying", error);
-                Timer::after(Duration::from_secs(1)).await;
+                Timer::after(RETRY_DELAY).await;
             }
             rprintln!("GPS up: {} solutions a second", GPS_RATE_HZ);
 
@@ -469,7 +456,7 @@ mod sensors {
     /// until everything waiting has been read, so each wake-up drains the hub
     /// before going back to waiting.
     #[embassy_executor::task]
-    pub async fn imu_task(mut imu: Imu, mut int: Input<'static>) {
+    pub async fn imu_task(mut imu: Imu) {
         loop {
             match start(&mut imu).await {
                 Ok(id) => rprintln!(
@@ -481,15 +468,22 @@ mod sensors {
                 ),
                 Err(error) => {
                     rprintln!("BNO085 bring-up failed: {:?}, retrying", error);
-                    Timer::after(Duration::from_secs(1)).await;
+                    Timer::after(RETRY_DELAY).await;
                     continue;
                 }
             }
 
             'reporting: loop {
-                if with_timeout(IMU_SILENCE, int.wait_for_low()).await.is_err() {
-                    rprintln!("BNO085 went quiet, starting it again");
-                    break;
+                match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        rprintln!("BNO085 wait failed: {:?}, starting it again", error);
+                        break;
+                    }
+                    Err(_) => {
+                        rprintln!("BNO085 went quiet, starting it again");
+                        break;
+                    }
                 }
 
                 loop {
@@ -524,7 +518,7 @@ mod sensors {
     }
 
     /// Resets the hub and starts its rotation vector.
-    async fn start(imu: &mut Imu) -> Result<ProductId, bno085::Error<i2c::master::Error>> {
+    async fn start(imu: &mut Imu) -> Result<ProductId, ImuError> {
         let id = imu.init().await?;
         imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
             .await?;
@@ -547,7 +541,7 @@ mod sensors {
                 }
                 Err(error) => {
                     rprintln!("TF03 not answering: {:?}, retrying", error);
-                    Timer::after(Duration::from_secs(1)).await;
+                    Timer::after(RETRY_DELAY).await;
                 }
             }
         }
