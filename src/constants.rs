@@ -6,28 +6,44 @@
 //!
 //! # Pin map
 //!
-//! For the ESP32-S3-DevKitC-1-N8R8. Every sensor wires to header J1; the LCD
-//! uses two pins on J3. Board TX goes to the sensor's RX and board RX to the
-//! sensor's TX. All grounds are common.
+//! For the ESP32-S3-DevKitC-1-N8R8, following the project's pin map
+//! spreadsheet (`PING_Pin_Map.xlsx`). Every sensor wires to header J1; the
+//! display's two signal pins are on J3. Board TX goes to the sensor's RX and
+//! board RX to the sensor's TX. All grounds are common.
 //!
-//! | Device  | Signal              | GPIO | Header | Bus              |
-//! |---------|---------------------|------|--------|------------------|
-//! | Button  | trigger, to GND     | 4    | J1-4   | input, pull-up   |
-//! | NEO-M9N | RESET_N (optional)  | 6    | J1-6   | output           |
-//! | NEO-M9N | TIMEPULSE (optional)| 7    | J1-7   | input            |
-//! | NEO-M9N | RXD                 | 15   | J1-8   | UART2 TX         |
-//! | NEO-M9N | TXD                 | 16   | J1-9   | UART2 RX         |
-//! | TF03    | brown, TTL_RXD      | 17   | J1-10  | UART1 TX         |
-//! | TF03    | yellow, TTL_TXD     | 18   | J1-11  | UART1 RX         |
-//! | BNO085  | P0 (PS0 / WAKE)     | 8    | J1-12  | output           |
-//! | BNO085  | RST                 | 9    | J1-15  | output           |
-//! | BNO085  | CS                  | 10   | J1-16  | SPI2 CS          |
-//! | BNO085  | DI (MOSI)           | 11   | J1-17  | SPI2 MOSI        |
-//! | BNO085  | SCL (SCK in SPI)    | 12   | J1-18  | SPI2 SCK         |
-//! | BNO085  | SDA (MISO in SPI)   | 13   | J1-19  | SPI2 MISO        |
-//! | BNO085  | INT                 | 14   | J1-20  | input, pull-up   |
-//! | LCD     | SDA                 | 1    | J3-4   | I2C0 SDA         |
-//! | LCD     | SCL                 | 2    | J3-5   | I2C0 SCL         |
+//! | Device  | Signal              | GPIO | Header | Bus                    |
+//! |---------|---------------------|------|--------|------------------------|
+//! | Button  | trigger, to GND     | 4    | J1-4   | input, pull-up         |
+//! | NEO-M9N | RESET_N (optional)  | 6    | J1-6   | output                 |
+//! | NEO-M9N | TIMEPULSE (optional)| 7    | J1-7   | input                  |
+//! | NEO-M9N | RXD                 | 15   | J1-8   | UART2 TX, 38400 8N1    |
+//! | NEO-M9N | TXD                 | 16   | J1-9   | UART2 RX, 38400 8N1    |
+//! | TF03    | brown, TTL_RXD      | 17   | J1-10  | UART1 TX, 115200 8N1   |
+//! | TF03    | yellow, TTL_TXD     | 18   | J1-11  | UART1 RX, 115200 8N1   |
+//! | BNO085  | P0 (PS0 / WAKE)     | 8    | J1-12  | output                 |
+//! | BNO085  | RST                 | 9    | J1-15  | output, active low     |
+//! | BNO085  | CS                  | 10   | J1-16  | SPI2 CS, mode 3        |
+//! | BNO085  | DI (MOSI)           | 11   | J1-17  | SPI2 MOSI              |
+//! | BNO085  | SCL (SCK in SPI)    | 12   | J1-18  | SPI2 SCK, 1 MHz        |
+//! | BNO085  | SDA (MISO in SPI)   | 13   | J1-19  | SPI2 MISO              |
+//! | BNO085  | INT                 | 14   | J1-20  | input, pull-up         |
+//! | Display | SDA                 | 1    | J3-4   | I2C0 SDA, 400 kHz      |
+//! | Display | SCL                 | 2    | J3-5   | I2C0 SCL, 400 kHz      |
+//!
+//! Power and ground:
+//!
+//! | Device  | Pin                 | Board connection           | Header |
+//! |---------|---------------------|----------------------------|--------|
+//! | TF03    | red (VCC)           | fused 12 V line, after D1  | —      |
+//! | NEO-M9N | VCC                 | 3V3                        | J1-1   |
+//! | BNO085  | VIN, P1 (PS1)       | 3V3                        | J1-1   |
+//! | Display | VCC                 | 3V3                        | J1-2   |
+//! | Board   | 5V                  | buck converter, 5.1 V      | J1-21  |
+//! | All     | GND, TF03 black     | common ground              | J1-22  |
+//!
+//! Left unconnected: the TF03's blue (GPIO out), white (CAN_L) and green
+//! (CAN_H) wires; the NEO-M9N's D_SEL and SAFEBOOT_N, which the datasheet
+//! says to leave open; and the BNO085 breakout's BT pin.
 //!
 //! Pins kept clear on purpose: GPIO0, 3, 45 and 46 are strapping pins read at
 //! boot; GPIO19 and 20 are the USB port; GPIO43 and 44 are UART0; GPIO26–37
@@ -35,15 +51,20 @@
 //! GPIO5 can read analog voltages with Wi-Fi on, so it is the one to use for
 //! battery monitoring.
 //!
-//! Power: the TF03's red wire takes the fused 12 V line (5–24 V), the board
-//! takes 5.1 V from the buck converter on its 5V pin, and the GPS, IMU and
-//! LCD run from the board's 3V3 pins.
+//! The TF03 takes 5–24 V, so it runs straight from the fused battery line,
+//! keeping its 480 mA peak off the board's regulator. The board's own
+//! regulator makes 3.3 V for the GPS, IMU and display, about 0.14 A in all.
+//! F1 at the battery protects every wire after it, and D1 keeps a reversed
+//! battery away from the LiDAR and the buck converter.
 //!
 //! The BNO085 signal names above are the labels printed on the Adafruit
 //! BNO085 breakout. In SPI mode its SCL pin is the clock and SDA is data out
-//! of the sensor. On that breakout, VIN takes the board's 3V3, P1 ties to the
-//! breakout's own 3Vo pin (P0 and P1 both high selects SPI), and BT stays
-//! unconnected.
+//! of the sensor. P0 and P1 both high selects SPI; P1 can take the board's
+//! 3V3 or the breakout's own 3Vo pin, which is the same 3.3 V.
+//!
+//! The display is a 128 by 64 OLED module with an SH1106 controller, at I2C
+//! address 0x3C. The pin map spreadsheet still describes a PCF8574 character
+//! LCD at 0x27 on these pins; the pins are right, the device notes are not.
 //!
 //! # Using the pins
 //!
@@ -130,7 +151,7 @@ macro_rules! board_pin {
         $p.GPIO8
     };
 
-    // I2C LCD (PCF8574 backpack), run from 3V3.
+    // I2C display (SSD1306 OLED), run from 3V3.
     ($p:ident . LCD_SDA) => {
         $p.GPIO1
     };
@@ -173,11 +194,17 @@ pub const GPS_BAUD_RATE: u32 = crate::neo_m9n::DEFAULT_BAUD_RATE;
 /// link is proven.
 pub const IMU_SPI_FREQUENCY_KHZ: u32 = 1_000;
 
-/// I2C clock for the LCD, in kilohertz. 100 kHz is the PCF8574's maximum.
-pub const LCD_I2C_FREQUENCY_KHZ: u32 = 100;
+/// I2C clock for the display, in kilohertz: the SSD1306's fast mode maximum.
+pub const LCD_I2C_FREQUENCY_KHZ: u32 = 400;
 
-/// The LCD backpack's I2C address: 0x27 for a PCF8574, 0x3F for a PCF8574A.
-pub const LCD_ADDRESS: u8 = 0x27;
+/// The display's I2C address: 0x3C on most SSD1306 modules, 0x3D with the
+/// address resistor on the back moved.
+pub const LCD_ADDRESS: u8 = 0x3C;
+
+/// Where the glass starts in the display controller's memory: 0 for an
+/// SSD1306 (most 0.96" modules), 2 for an SH1106 (most 1.3" modules). Text
+/// shifted two pixels with garbage at one edge means this is wrong.
+pub const LCD_COLUMN_OFFSET: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Sensor rates
@@ -238,6 +265,11 @@ pub const DEBOUNCE: Duration = Duration::from_millis(30);
 /// drains while a computer reads it, so with nothing at the other end a write
 /// would otherwise wait forever.
 pub const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How often the demos rewrite the display. Each full rewrite holds the I2C
+/// bus for about 25 ms, and a reading that changes faster than this is a blur
+/// anyway.
+pub const LCD_REFRESH: Duration = Duration::from_millis(200);
 
 /// How long to wait before retrying a sensor that failed to come up.
 pub const RETRY_DELAY: Duration = Duration::from_secs(1);

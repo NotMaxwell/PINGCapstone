@@ -38,7 +38,7 @@ pub mod transport;
 
 use embedded_hal_async::delay::DelayNs;
 
-pub use reports::{Accuracy, Event, Quaternion, RawVec3, SensorData, SensorId, Vec3};
+pub use reports::{Accuracy, Euler, Event, Quaternion, RawVec3, SensorData, SensorId, Vec3};
 use shtp::{Channel, HEADER_LEN, Header};
 pub use transport::{I2cError, I2cTransport, SpiError, SpiTransport, Transport};
 

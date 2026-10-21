@@ -1,8 +1,14 @@
 //! Standalone demo binary for the BNO085 driver.
 //!
 //! Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
-//! prints each quaternion over RTT. Kept separate from `main.rs` so the
-//! application entry point stays clear of sensor bring-up code.
+//! shows the orientation as yaw, pitch and roll on the display and over RTT,
+//! five times a second. Kept separate from `main.rs` so the application entry
+//! point stays clear of sensor bring-up code.
+//!
+//! The angles are those of the breakout itself, with its printed +Y axis as
+//! forward; see [`Quaternion::to_euler`]. Yaw is from magnetic north.
+//!
+//! [`Quaternion::to_euler`]: ping_capstone::bno085::Quaternion::to_euler
 
 #![no_std]
 #![no_main]
@@ -17,12 +23,16 @@ use embassy_executor::Spawner;
 use embassy_time::{Delay, Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::spi::Mode as SpiMode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use ping_capstone::bno085::{Bno085, SpiTransport};
-use ping_capstone::constants::{HEAP_SIZE, IMU_SPI_FREQUENCY_KHZ};
+use ping_capstone::constants::{
+    HEAP_SIZE, IMU_SPI_FREQUENCY_KHZ, LCD_ADDRESS, LCD_COLUMN_OFFSET, LCD_I2C_FREQUENCY_KHZ,
+};
+use ping_capstone::ssd1306::Ssd1306;
 use ping_capstone::{board_bus, board_pin};
 use rtt_target::rprintln;
 
@@ -100,10 +110,31 @@ async fn main(spawner: Spawner) -> ! {
         ),
     );
 
-    spawner.spawn(imu_task(Bno085::new(transport, Delay)).expect("Failed to spawn the IMU task"));
+    // Display: the OLED on I2C0. A missing or miswired display only
+    // costs the demo its screen; the readings still go over RTT.
+    let lcd_i2c = I2c::new(
+        board_bus!(peripherals.LCD_I2C),
+        I2cConfig::default().with_frequency(Rate::from_khz(LCD_I2C_FREQUENCY_KHZ)),
+    )
+    .expect("Failed to configure the display I2C bus")
+    .with_sda(board_pin!(peripherals.LCD_SDA))
+    .with_scl(board_pin!(peripherals.LCD_SCL))
+    .into_async();
+    let mut lcd = Ssd1306::new(lcd_i2c, LCD_ADDRESS, LCD_COLUMN_OFFSET);
+    if let Err(error) = lcd.init().await {
+        rprintln!(
+            "Display not answering at {:#04x}: {:?}; I2C devices found: {}",
+            LCD_ADDRESS,
+            error,
+            lcd.scan().await
+        );
+    }
 
+    spawner
+        .spawn(imu_task(Bno085::new(transport, Delay), lcd).expect("Failed to spawn the IMU task"));
+
+    // Everything happens in the task.
     loop {
-        rprintln!("Hello world!");
         Timer::after(Duration::from_secs(1)).await;
     }
 }
@@ -114,17 +145,21 @@ mod imu {
     //! The IMU task lives in its own module so that the stack frame lint can
     //! be relaxed for it. An embassy task's future is allocated once in a
     //! static task pool rather than on the stack, and most of its size here
-    //! is the HAL's SPI futures and the formatting machinery behind
+    //! is the HAL's SPI and I2C futures and the formatting machinery behind
     //! rprintln!, not anything this code puts on the stack.
     #![allow(clippy::large_stack_frames)]
 
-    use embassy_time::{Delay, Timer};
+    use core::fmt;
+
+    use embassy_time::{Delay, Instant, Timer};
     use esp_hal::Async;
     use esp_hal::gpio::{Input, Output};
+    use esp_hal::i2c::master::I2c;
     use esp_hal::spi::master::Spi;
-    use ping_capstone::bno085::{Bno085, SensorData, SensorId, SpiTransport};
-    use ping_capstone::constants::{IMU_REPORT_INTERVAL_US, RETRY_DELAY};
-    use rtt_target::rprintln;
+    use ping_capstone::bno085::{Accuracy, Bno085, SensorData, SensorId, SpiTransport};
+    use ping_capstone::constants::{IMU_REPORT_INTERVAL_US, LCD_REFRESH, RETRY_DELAY};
+    use ping_capstone::ssd1306::{ROWS, Ssd1306};
+    use rtt_target::{rprint, rprintln};
 
     type Imu = Bno085<
         SpiTransport<
@@ -137,27 +172,83 @@ mod imu {
         Delay,
     >;
 
-    /// Reads orientation from the BNO085.
+    type Display = Ssd1306<I2c<'static, Async>>;
+
+    /// Shows `lines` on the display, one per row, blanking the rows below
+    /// them, and prints them over RTT on one line. A failed display write is
+    /// logged and otherwise ignored, so a loose display never stops the
+    /// IMU being read.
+    async fn show(lcd: &mut Display, lines: &[fmt::Arguments<'_>]) {
+        let mut separator = "";
+        for line in lines {
+            rprint!("{}{}", separator, line);
+            separator = " | ";
+        }
+        rprintln!();
+
+        for row in 0..ROWS {
+            let written = match lines.get(row) {
+                Some(&line) => lcd.print_line(row, line).await,
+                None => lcd.write_line(row, "").await,
+            };
+            if let Err(error) = written {
+                rprintln!("Display write failed: {:?}", error);
+                return;
+            }
+        }
+    }
+
+    /// Whether it is time to show the next reading, at most once every
+    /// [`LCD_REFRESH`]. The sensors report faster than anyone can read, and
+    /// each rewrite of the display holds up the task for a few milliseconds.
+    fn due(next_refresh: &mut Instant) -> bool {
+        let now = Instant::now();
+        if now < *next_refresh {
+            return false;
+        }
+        *next_refresh = now + LCD_REFRESH;
+        true
+    }
+
+    /// Reads orientation from the BNO085 and shows it.
     ///
     /// The sensor pulls INT low when it has something to say, and holds it low
     /// until everything waiting has been read, so each wake-up drains the hub
     /// before going back to sleep.
     #[embassy_executor::task]
-    pub async fn imu_task(mut imu: Imu) {
+    pub async fn imu_task(mut imu: Imu, mut lcd: Display) {
+        show(
+            &mut lcd,
+            &[format_args!("BNO085"), format_args!("starting")],
+        )
+        .await;
         loop {
             match imu.init().await {
                 Ok(id) => {
-                    rprintln!(
-                        "BNO085 up: firmware {}.{}.{}, reset cause {:?}",
-                        id.sw_version_major,
-                        id.sw_version_minor,
-                        id.sw_version_patch,
-                        id.reset_cause
-                    );
+                    show(
+                        &mut lcd,
+                        &[
+                            format_args!("BNO085 up"),
+                            format_args!(
+                                "fw {}.{}.{}",
+                                id.sw_version_major, id.sw_version_minor, id.sw_version_patch
+                            ),
+                            format_args!("reset {:?}", id.reset_cause),
+                        ],
+                    )
+                    .await;
                     break;
                 }
                 Err(error) => {
-                    rprintln!("BNO085 init failed: {:?}, retrying", error);
+                    show(
+                        &mut lcd,
+                        &[
+                            format_args!("BNO085 no reply"),
+                            format_args!("{:?}", error),
+                            format_args!("retrying"),
+                        ],
+                    )
+                    .await;
                     Timer::after(RETRY_DELAY).await;
                 }
             }
@@ -167,13 +258,26 @@ mod imu {
             .enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
             .await
         {
-            rprintln!("BNO085 could not start reporting: {:?}", error);
+            show(
+                &mut lcd,
+                &[
+                    format_args!("BNO085 refused"),
+                    format_args!("to report"),
+                    format_args!("{:?}", error),
+                ],
+            )
+            .await;
             return;
         }
 
+        let mut next_refresh = Instant::now();
         loop {
             if let Err(error) = imu.wait_for_data().await {
-                rprintln!("BNO085 wait failed: {:?}", error);
+                show(
+                    &mut lcd,
+                    &[format_args!("BNO085 wait"), format_args!("{:?}", error)],
+                )
+                .await;
                 Timer::after(RETRY_DELAY).await;
                 continue;
             }
@@ -181,26 +285,43 @@ mod imu {
             loop {
                 match imu.read_event().await {
                     Ok(Some(event)) => {
-                        if let SensorData::RotationVector {
+                        let SensorData::RotationVector {
                             quaternion,
                             accuracy_rad,
                         } = event.data
-                        {
-                            rprintln!(
-                                "quat i={} j={} k={} r={} (+/- {} rad, {:?})",
-                                quaternion.i,
-                                quaternion.j,
-                                quaternion.k,
-                                quaternion.real,
-                                accuracy_rad,
-                                event.accuracy
-                            );
+                        else {
+                            continue;
+                        };
+                        if !due(&mut next_refresh) {
+                            continue;
                         }
+
+                        let angles = quaternion.to_euler();
+                        let accuracy = match event.accuracy {
+                            Accuracy::High => "high",
+                            Accuracy::Medium => "med",
+                            Accuracy::Low => "low",
+                            Accuracy::Unreliable => "bad",
+                        };
+                        show(
+                            &mut lcd,
+                            &[
+                                format_args!("yaw   {:>7.1}°", angles.yaw_deg),
+                                format_args!("pitch {:>+7.1}°", angles.pitch_deg),
+                                format_args!("roll  {:>+7.1}°", angles.roll_deg),
+                                format_args!("acc {} ±{:.1}°", accuracy, accuracy_rad.to_degrees()),
+                            ],
+                        )
+                        .await;
                     }
                     // Nothing left waiting; go back to the interrupt pin.
                     Ok(None) => break,
                     Err(error) => {
-                        rprintln!("BNO085 read failed: {:?}", error);
+                        show(
+                            &mut lcd,
+                            &[format_args!("BNO085 read"), format_args!("{:?}", error)],
+                        )
+                        .await;
                         break;
                     }
                 }

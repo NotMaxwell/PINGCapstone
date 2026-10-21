@@ -5,6 +5,8 @@
 //! lengths here follow the CEVA SH-2 reference driver (`sh2.c`,
 //! `sh2_SensorValue.c`).
 
+use libm::{asinf, atan2f};
+
 /// Identifiers for the sensors the hub can be asked to report.
 ///
 /// The value doubles as the feature report ID used to enable the sensor and
@@ -175,6 +177,59 @@ pub struct Quaternion {
     pub j: f32,
     pub k: f32,
     pub real: f32,
+}
+
+impl Quaternion {
+    /// The same orientation as yaw, pitch and roll, the way an aircraft
+    /// would describe it if it flew with the breakout's printed axes: +Y
+    /// forward, +X out to the right and +Z up.
+    ///
+    /// The rotation vector turns the sensor's axes into a world frame of
+    /// east, magnetic north and up, so lying level with +Y towards magnetic
+    /// north reads zero on all three. Yaw is applied first, then pitch, then
+    /// roll. Straight up or down (pitch ±90°), yaw and roll turn about the
+    /// same axis and only their difference is meaningful.
+    pub fn to_euler(&self) -> Euler {
+        let Self {
+            i: x,
+            j: y,
+            k: z,
+            real: w,
+        } = *self;
+
+        // Elements of the rotation matrix, written out in full so that
+        // rounding in the fixed point components scales them rather than
+        // skewing them. atan2 ignores the scale; asin needs it divided out.
+        let norm = w * w + x * x + y * y + z * z;
+        let r01 = 2.0 * (x * y - w * z);
+        let r11 = w * w - x * x + y * y - z * z;
+        let r20 = 2.0 * (x * z - w * y);
+        let r21 = 2.0 * (y * z + w * x);
+        let r22 = w * w - x * x - y * y + z * z;
+
+        let mut yaw_deg = atan2f(r01, r11).to_degrees();
+        if yaw_deg < 0.0 {
+            yaw_deg += 360.0;
+        }
+        Euler {
+            yaw_deg,
+            pitch_deg: asinf((r21 / norm).clamp(-1.0, 1.0)).to_degrees(),
+            roll_deg: atan2f(-r20, r22).to_degrees(),
+        }
+    }
+}
+
+/// An orientation as yaw, pitch and roll; see [`Quaternion::to_euler`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Euler {
+    /// Compass bearing of +Y, degrees clockwise from magnetic north, from 0
+    /// up to 360.
+    pub yaw_deg: f32,
+    /// Degrees +Y points above the horizon, negative below, from -90 to 90.
+    pub pitch_deg: f32,
+    /// Degrees the right side (+X) has dipped, negative when it has risen,
+    /// from -180 to 180.
+    pub roll_deg: f32,
 }
 
 /// An unscaled measurement straight off the ADC, with the hub's own timestamp.
