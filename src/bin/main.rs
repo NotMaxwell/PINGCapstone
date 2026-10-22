@@ -528,22 +528,21 @@ mod sensors {
     /// Keeps the latest distance from the TF03.
     #[embassy_executor::task]
     pub async fn lidar_task(mut lidar: Tf03<Uart<'static, Async>>) {
-        loop {
-            match lidar.firmware_version().await {
-                Ok(version) => {
-                    rprintln!(
-                        "TF03 up: firmware {}.{}.{}",
-                        version.major,
-                        version.minor,
-                        version.patch
-                    );
-                    break;
-                }
-                Err(error) => {
-                    rprintln!("TF03 not answering: {:?}, retrying", error);
-                    Timer::after(RETRY_DELAY).await;
-                }
-            }
+        // The TF03 streams measurements unasked, so distances need only its
+        // TxD wire. Answering a command also needs its RxD wire, so the
+        // firmware version is asked for once, for the log, and its answer
+        // waited for no further.
+        match lidar.firmware_version().await {
+            Ok(version) => rprintln!(
+                "TF03 firmware {}.{}.{}",
+                version.major,
+                version.minor,
+                version.patch
+            ),
+            Err(error) => rprintln!(
+                "TF03 did not answer the firmware version request: {:?}. Reading distances anyway.",
+                error
+            ),
         }
 
         loop {

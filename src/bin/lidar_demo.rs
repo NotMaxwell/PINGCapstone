@@ -1,8 +1,9 @@
 //! Standalone demo binary for the TF03 LiDAR driver.
 //!
-//! Brings up the TF03 over UART, reads its firmware version and shows the
-//! measured distance and signal strength on the display and over RTT, five
-//! times a second. Kept separate from `main.rs` so the
+//! Listens to the TF03 over UART and shows the measured distance and signal
+//! strength on the display and over RTT, five times a second. It also asks
+//! once for the TF03's firmware version, but reads distances whether or not
+//! that is answered. Kept separate from `main.rs` so the
 //! application entry point stays clear of sensor bring-up code.
 //!
 //! Nothing here changes the TF03's configuration, which it keeps in flash.
@@ -121,13 +122,13 @@ mod lidar {
     use core::fmt;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use embassy_time::{Instant, Timer};
+    use embassy_time::{Duration, Instant, with_timeout};
     use esp_hal::Async;
     use esp_hal::i2c::master::I2c;
     use esp_hal::uart::Uart;
-    use ping_capstone::constants::{LCD_REFRESH, RETRY_DELAY};
+    use ping_capstone::constants::LCD_REFRESH;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
-    use ping_capstone::tf03::{Error, Heard, Tf03};
+    use ping_capstone::tf03::Tf03;
     use rtt_target::{rprint, rprintln};
 
     type Display = Ssd1306<I2c<'static, Async>>;
@@ -165,17 +166,10 @@ mod lidar {
         }
     }
 
-    /// What the TF03's line carried when it did not answer, and what to
-    /// check, in two lines short enough for the display.
-    fn advice<E>(error: &Error<E>) -> Option<[&'static str; 2]> {
-        match error {
-            Error::NoReply(Heard::Nothing) => Some(["nothing heard", "power/brown/GND"]),
-            Error::NoReply(Heard::Noise) => Some(["noise only", "check GND, baud"]),
-            Error::NoReply(Heard::OwnCommand) => Some(["own cmd echoed", "brown/power"]),
-            Error::NoReply(Heard::Measurements) => Some(["data, no answer", "check blue wire"]),
-            _ => None,
-        }
-    }
+    /// How long the TF03 may go without a measurement before the demo says
+    /// so. It sends 100 a second, so a whole second without one means none
+    /// are arriving.
+    const SILENCE: Duration = Duration::from_secs(1);
 
     /// Whether it is time to show the next reading, at most once every
     /// [`LCD_REFRESH`]. The sensors report faster than anyone can read, and
@@ -194,60 +188,44 @@ mod lidar {
     #[embassy_executor::task]
     pub async fn lidar_task(mut lidar: Tf03<Uart<'static, Async>>, mut lcd: Display) {
         show(&mut lcd, &[format_args!("TF03"), format_args!("starting")]).await;
-        loop {
-            match lidar.firmware_version().await {
-                Ok(version) => {
-                    show(
-                        &mut lcd,
-                        &[
-                            format_args!("TF03 up"),
-                            format_args!(
-                                "fw {}.{}.{}",
-                                version.major, version.minor, version.patch
-                            ),
-                        ],
-                    )
-                    .await;
-                    break;
-                }
-                Err(error) => {
-                    match advice(&error) {
-                        Some([what, check]) => {
-                            show(
-                                &mut lcd,
-                                &[
-                                    format_args!("TF03 no reply"),
-                                    format_args!("{}", what),
-                                    format_args!("{}", check),
-                                ],
-                            )
-                            .await
-                        }
-                        None => {
-                            show(
-                                &mut lcd,
-                                &[
-                                    format_args!("TF03 no reply"),
-                                    format_args!("{:?}", error),
-                                ],
-                            )
-                            .await
-                        }
-                    }
-                    Timer::after(RETRY_DELAY).await;
-                }
-            }
+
+        // The TF03 streams measurements unasked, so distances need only its
+        // TxD wire. Answering a command also needs its RxD wire, so the
+        // firmware version is asked for once, for the log, and its answer
+        // waited for no further.
+        match lidar.firmware_version().await {
+            Ok(version) => rprintln!(
+                "TF03 firmware {}.{}.{}",
+                version.major,
+                version.minor,
+                version.patch
+            ),
+            Err(error) => rprintln!(
+                "TF03 did not answer the firmware version request: {:?}. Reading distances anyway.",
+                error
+            ),
         }
 
         let mut next_refresh = Instant::now();
         loop {
-            let reading = lidar.read().await;
-            if !due(&mut next_refresh) {
+            let reading = with_timeout(SILENCE, lidar.read()).await;
+            if reading.is_ok() && !due(&mut next_refresh) {
                 continue;
             }
 
             match reading {
-                Ok(measurement) => match measurement.distance_cm {
+                Err(_) => {
+                    show(
+                        &mut lcd,
+                        &[
+                            format_args!("TF03 no data"),
+                            format_args!("check power,"),
+                            format_args!("brown wire, GND"),
+                        ],
+                    )
+                    .await
+                }
+                Ok(Ok(measurement)) => match measurement.distance_cm {
                     Some(distance_cm) => {
                         show(
                             &mut lcd,
@@ -272,7 +250,7 @@ mod lidar {
                 },
                 // Typically an RX FIFO overflow; the driver resynchronises
                 // on the next frame, so carry on reading.
-                Err(error) => {
+                Ok(Err(error)) => {
                     show(
                         &mut lcd,
                         &[
