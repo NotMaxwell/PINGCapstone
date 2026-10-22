@@ -68,8 +68,8 @@ async fn main(spawner: Spawner) -> ! {
             .expect("Failed to initialize Wi-Fi controller");
 
     // Pins come from ping_capstone::constants. The TF03's UART is 3.3 V, so
-    // it connects directly: board TX to the brown TTL_RXD wire, board RX to
-    // the yellow TTL_TXD wire, and the grounds together. The red supply wire
+    // it connects directly: board TX to the blue UART RxD wire, board RX to
+    // the brown UART TxD wire, and the grounds together. The red supply wire
     // takes 5-24 V; on PING it runs from the fused 12 V line.
     let uart = Uart::new(
         board_bus!(peripherals.LIDAR_UART),
@@ -119,6 +119,7 @@ mod lidar {
     #![allow(clippy::large_stack_frames)]
 
     use core::fmt;
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     use embassy_time::{Instant, Timer};
     use esp_hal::Async;
@@ -126,10 +127,14 @@ mod lidar {
     use esp_hal::uart::Uart;
     use ping_capstone::constants::{LCD_REFRESH, RETRY_DELAY};
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
-    use ping_capstone::tf03::Tf03;
+    use ping_capstone::tf03::{Error, Heard, Tf03};
     use rtt_target::{rprint, rprintln};
 
     type Display = Ssd1306<I2c<'static, Async>>;
+
+    /// Whether the last display write failed, so a display that stays
+    /// unplugged is reported once rather than on every refresh.
+    static DISPLAY_FAILING: AtomicBool = AtomicBool::new(false);
 
     /// Shows `lines` on the display, one per row, blanking the rows below
     /// them, and prints them over RTT on one line. A failed display write is
@@ -149,9 +154,26 @@ mod lidar {
                 None => lcd.write_line(row, "").await,
             };
             if let Err(error) = written {
-                rprintln!("Display write failed: {:?}", error);
+                if !DISPLAY_FAILING.swap(true, Ordering::Relaxed) {
+                    rprintln!("Display write failed: {:?}", error);
+                }
                 return;
             }
+        }
+        if DISPLAY_FAILING.swap(false, Ordering::Relaxed) {
+            rprintln!("Display back");
+        }
+    }
+
+    /// What the TF03's line carried when it did not answer, and what to
+    /// check, in two lines short enough for the display.
+    fn advice<E>(error: &Error<E>) -> Option<[&'static str; 2]> {
+        match error {
+            Error::NoReply(Heard::Nothing) => Some(["nothing heard", "power/brown/GND"]),
+            Error::NoReply(Heard::Noise) => Some(["noise only", "check GND, baud"]),
+            Error::NoReply(Heard::OwnCommand) => Some(["own cmd echoed", "brown/power"]),
+            Error::NoReply(Heard::Measurements) => Some(["data, no answer", "check blue wire"]),
+            _ => None,
         }
     }
 
@@ -189,15 +211,29 @@ mod lidar {
                     break;
                 }
                 Err(error) => {
-                    show(
-                        &mut lcd,
-                        &[
-                            format_args!("TF03 no reply"),
-                            format_args!("{:?}", error),
-                            format_args!("retrying"),
-                        ],
-                    )
-                    .await;
+                    match advice(&error) {
+                        Some([what, check]) => {
+                            show(
+                                &mut lcd,
+                                &[
+                                    format_args!("TF03 no reply"),
+                                    format_args!("{}", what),
+                                    format_args!("{}", check),
+                                ],
+                            )
+                            .await
+                        }
+                        None => {
+                            show(
+                                &mut lcd,
+                                &[
+                                    format_args!("TF03 no reply"),
+                                    format_args!("{:?}", error),
+                                ],
+                            )
+                            .await
+                        }
+                    }
                     Timer::after(RETRY_DELAY).await;
                 }
             }

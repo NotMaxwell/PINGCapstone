@@ -145,8 +145,8 @@ async fn main(spawner: Spawner) -> ! {
         ),
     );
 
-    // LiDAR: board TX to the TF03's brown TTL_RXD wire, board RX to its
-    // yellow TTL_TXD wire.
+    // LiDAR: board TX to the TF03's blue UART RxD wire, board RX to its
+    // brown UART TxD wire.
     let lidar_uart = Uart::new(
         board_bus!(peripherals.LIDAR_UART),
         UartConfig::default().with_baudrate(LIDAR_BAUD_RATE),

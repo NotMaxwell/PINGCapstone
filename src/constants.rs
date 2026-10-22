@@ -18,8 +18,8 @@
 //! | NEO-M9N | TIMEPULSE (optional)| 7    | J1-7   | input                  |
 //! | NEO-M9N | RXD                 | 15   | J1-8   | UART2 TX, 38400 8N1    |
 //! | NEO-M9N | TXD                 | 16   | J1-9   | UART2 RX, 38400 8N1    |
-//! | TF03    | brown, TTL_RXD      | 17   | J1-10  | UART1 TX, 115200 8N1   |
-//! | TF03    | yellow, TTL_TXD     | 18   | J1-11  | UART1 RX, 115200 8N1   |
+//! | TF03    | blue, UART RxD      | 17   | J1-10  | UART1 TX, 115200 8N1   |
+//! | TF03    | brown, UART TxD     | 18   | J1-11  | UART1 RX, 115200 8N1   |
 //! | BNO085  | P0 (PS0 / WAKE)     | 8    | J1-12  | output                 |
 //! | BNO085  | RST                 | 9    | J1-15  | output, active low     |
 //! | BNO085  | CS                  | 10   | J1-16  | SPI2 CS, mode 3        |
@@ -41,8 +41,7 @@
 //! | Board   | 5V                  | buck converter, 5.1 V      | J1-21  |
 //! | All     | GND, TF03 black     | common ground              | J1-22  |
 //!
-//! Left unconnected: the TF03's blue (GPIO out), white (CAN_L) and green
-//! (CAN_H) wires; the NEO-M9N's D_SEL and SAFEBOOT_N, which the datasheet
+//! Left unconnected: the TF03's white (CAN_L) and green (CAN_H) wires; the NEO-M9N's D_SEL and SAFEBOOT_N, which the datasheet
 //! says to leave open; and the BNO085 breakout's BT pin.
 //!
 //! Pins kept clear on purpose: GPIO0, 3, 45 and 46 are strapping pins read at
@@ -50,6 +49,11 @@
 //! are the module's flash and octal PSRAM. GPIO5, 21 and 47 are free, and
 //! GPIO5 can read analog voltages with Wi-Fi on, so it is the one to use for
 //! battery monitoring.
+//!
+//! The TF03 is the 5–24 V UART/CAN version, whose six-wire cable follows
+//! Benewake's 2024 *TF03 UART/CAN User Manual*. The older 5 V version and its
+//! V1.0 manual use a seven-wire cable with brown as RxD and yellow as TxD;
+//! on this one brown is TxD and blue is RxD, and there is no yellow wire.
 //!
 //! The TF03 takes 5–24 V, so it runs straight from the fused battery line,
 //! keeping its 480 mA peak off the board's regulator. The board's own
@@ -110,8 +114,8 @@ macro_rules! board_pin {
         $p.GPIO7
     };
 
-    // TF03 LiDAR on UART1, its dedicated pins. Board TX to the brown
-    // TTL_RXD wire, board RX to the yellow TTL_TXD wire.
+    // TF03 LiDAR on UART1, its dedicated pins. Board TX to the blue UART
+    // RxD wire, board RX to the brown UART TxD wire.
     ($p:ident . LIDAR_TX) => {
         $p.GPIO17
     };
