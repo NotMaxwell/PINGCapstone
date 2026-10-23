@@ -93,8 +93,9 @@ pub enum Error<E> {
     Uart(E),
     /// The UART stream reported end of file.
     EndOfStream,
-    /// The TF03 did not answer a command in time.
-    Timeout,
+    /// The TF03 did not answer a command in time. The [`Heard`] says what
+    /// came over the line instead, which narrows down why.
+    NoReply(Heard),
     /// The TF03 answered a command with this nonzero status code.
     Rejected(u8),
     /// The TF03 answered a command with something other than the manual
@@ -102,6 +103,29 @@ pub enum Error<E> {
     Protocol,
     /// The TF03 does not support the value asked for.
     Unsupported,
+}
+
+/// What arrived on the TF03's line while the driver waited for an answer
+/// that never came, from least to most of the link proven working.
+///
+/// The TF03 streams measurements without being asked from the moment it is
+/// powered, so listening alone shows whether it is powered and its output
+/// reaches the board.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Heard {
+    /// Not one byte. The TF03 has no power, its TxD wire is not on the
+    /// board's RX pin, or the two do not share a ground.
+    Nothing,
+    /// Bytes, but no sound packet: the baud rates differ, the ground is
+    /// loose, or the RX wire is picking up interference.
+    Noise,
+    /// Only the command just sent, copied back. The board's TX is reaching
+    /// its own RX: through a short, or through an RX wire with nothing
+    /// driving it picking up the TX wire beside it. Nothing else answered.
+    OwnCommand,
+    /// Measurements, but no answer. The TF03 is powered and its TxD reaches
+    /// the board, but the board's TX does not reach the TF03's RxD wire.
+    Measurements,
 }
 
 /// One distance reading.
@@ -139,6 +163,10 @@ pub struct Tf03<U> {
     rx_end: usize,
     /// The distance that means nothing was measured.
     out_of_range_cm: u16,
+    /// The last command sent, to recognise it if it comes back.
+    sent: Option<Command>,
+    /// The most telling thing received since the last command was sent.
+    heard: Heard,
 }
 
 impl<U> Tf03<U> {
@@ -152,6 +180,8 @@ impl<U> Tf03<U> {
             rx_start: 0,
             rx_end: 0,
             out_of_range_cm: DEFAULT_OUT_OF_RANGE_CM,
+            sent: None,
+            heard: Heard::Nothing,
         }
     }
 
@@ -193,7 +223,8 @@ impl<U: Read> Tf03<U> {
         }
     }
 
-    /// Waits for the next packet of either kind.
+    /// Waits for the next packet of either kind, noting in `heard` what it
+    /// was.
     ///
     /// Cancelling this is safe as long as the UART's own read is: received
     /// bytes are only recorded once a read has completed.
@@ -203,6 +234,14 @@ impl<U: Read> Tf03<U> {
                 let byte = self.rx_buf[self.rx_start];
                 self.rx_start += 1;
                 if let Some(packet) = self.parser.push(byte) {
+                    let heard = match packet {
+                        Packet::Data(_) => Heard::Measurements,
+                        Packet::Response(response) if self.is_own_command(&response) => {
+                            Heard::OwnCommand
+                        }
+                        Packet::Response(_) => Heard::Noise,
+                    };
+                    self.heard = self.heard.max(heard);
                     return Ok(packet);
                 }
             }
@@ -210,6 +249,7 @@ impl<U: Read> Tf03<U> {
             match self.uart.read(&mut self.rx_buf).await {
                 Ok(0) => return Err(Error::EndOfStream),
                 Ok(count) => {
+                    self.heard = self.heard.max(Heard::Noise);
                     self.rx_start = 0;
                     self.rx_end = count;
                 }
@@ -223,14 +263,35 @@ impl<U: Read> Tf03<U> {
         }
     }
 
+    /// Whether `response` is a byte-for-byte copy of the last command sent.
+    fn is_own_command(&self, response: &Response) -> bool {
+        self.sent
+            .is_some_and(|sent| response.id == sent.id() && response.payload() == sent.payload())
+    }
+
     /// Waits for the TF03's answer to the command `id`, skipping data frames
     /// and answers to anything else.
-    async fn await_response(&mut self, id: u8) -> Result<Response, Error<U::Error>> {
+    ///
+    /// A copy of the command itself is skipped too unless `echoed` says the
+    /// TF03 answers by sending the command back. For those commands an echo
+    /// on the wire cannot be told from a real answer.
+    ///
+    /// UART errors are skipped too. While the TF03 streams, any pause in
+    /// reading overflows the RX FIFO, and that overflow is reported by the
+    /// first read after the command goes out, before the answer has even
+    /// arrived. esp-hal empties the FIFO when it reports an overflow, so the
+    /// answer still comes through on the reads that follow. The caller's
+    /// timeout bounds the wait.
+    async fn await_response(&mut self, id: u8, echoed: bool) -> Result<Response, Error<U::Error>> {
         loop {
-            if let Packet::Response(response) = self.read_packet().await?
-                && response.id == id
-            {
-                return Ok(response);
+            match self.read_packet().await {
+                Ok(Packet::Response(response))
+                    if response.id == id && (echoed || !self.is_own_command(&response)) =>
+                {
+                    return Ok(response);
+                }
+                Ok(_) | Err(Error::Uart(_)) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -241,7 +302,7 @@ impl<U: Read + Write> Tf03<U> {
     /// there and the baud rate matches.
     pub async fn firmware_version(&mut self) -> Result<FirmwareVersion, Error<U::Error>> {
         let response = self
-            .transact(Command::new(COMMAND_FIRMWARE_VERSION, &[]))
+            .transact(Command::new(COMMAND_FIRMWARE_VERSION, &[]), false)
             .await?;
 
         match *response.payload() {
@@ -257,7 +318,7 @@ impl<U: Read + Write> Tf03<U> {
     /// Reboots the TF03. Settings in flash are kept.
     pub async fn system_reset(&mut self) -> Result<(), Error<U::Error>> {
         let response = self
-            .transact(Command::new(COMMAND_SYSTEM_RESET, &[]))
+            .transact(Command::new(COMMAND_SYSTEM_RESET, &[]), false)
             .await?;
         check_status(&response)
     }
@@ -275,7 +336,7 @@ impl<U: Read + Write> Tf03<U> {
         }
 
         let command = Command::new(COMMAND_FRAME_RATE, &hz.to_le_bytes());
-        let response = self.transact(command).await?;
+        let response = self.transact(command, true).await?;
         check_echo(&command, &response)
     }
 
@@ -283,7 +344,7 @@ impl<U: Read + Write> Tf03<U> {
     /// stopped, the TF03 measures only when [`Tf03::trigger`] asks.
     pub async fn set_output_enabled(&mut self, enabled: bool) -> Result<(), Error<U::Error>> {
         let command = Command::new(COMMAND_OUTPUT_ENABLE, &[enabled as u8]);
-        let response = self.transact(command).await?;
+        let response = self.transact(command, true).await?;
         check_echo(&command, &response)
     }
 
@@ -295,14 +356,14 @@ impl<U: Read + Write> Tf03<U> {
 
         with_timeout(RESPONSE_TIMEOUT, self.read())
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::NoReply(self.heard))?
     }
 
     /// Changes the TF03's UART baud rate.
     ///
     /// The host UART has to be reconfigured to match afterwards, and the
     /// manual does not say which of the two rates the TF03 answers this
-    /// command at. A [`Error::Timeout`] here therefore does not mean the
+    /// command at. An [`Error::NoReply`] here therefore does not mean the
     /// change failed: switch the host UART over and confirm with
     /// [`Tf03::firmware_version`].
     pub async fn set_baud_rate(&mut self, baud: u32) -> Result<(), Error<U::Error>> {
@@ -311,7 +372,7 @@ impl<U: Read + Write> Tf03<U> {
         }
 
         let command = Command::new(COMMAND_BAUD_RATE, &baud.to_le_bytes());
-        let response = self.transact(command).await?;
+        let response = self.transact(command, true).await?;
         check_echo(&command, &response)
     }
 
@@ -322,10 +383,10 @@ impl<U: Read + Write> Tf03<U> {
         threshold_cm: u16,
     ) -> Result<(), Error<U::Error>> {
         let response = self
-            .transact(Command::new(
-                COMMAND_OUT_OF_RANGE,
-                &threshold_cm.to_le_bytes(),
-            ))
+            .transact(
+                Command::new(COMMAND_OUT_OF_RANGE, &threshold_cm.to_le_bytes()),
+                false,
+            )
             .await?;
         check_status(&response)?;
 
@@ -339,7 +400,7 @@ impl<U: Read + Write> Tf03<U> {
     /// this command; calling it after configuring costs nothing.
     pub async fn save_settings(&mut self) -> Result<(), Error<U::Error>> {
         let response = self
-            .transact(Command::new(COMMAND_SAVE_SETTINGS, &[]))
+            .transact(Command::new(COMMAND_SAVE_SETTINGS, &[]), false)
             .await?;
         check_status(&response)
     }
@@ -348,7 +409,7 @@ impl<U: Read + Write> Tf03<U> {
     /// frame rate of 100 Hz.
     pub async fn restore_defaults(&mut self) -> Result<(), Error<U::Error>> {
         let response = self
-            .transact(Command::new(COMMAND_RESTORE_DEFAULTS, &[]))
+            .transact(Command::new(COMMAND_RESTORE_DEFAULTS, &[]), false)
             .await?;
         check_status(&response)?;
 
@@ -356,16 +417,27 @@ impl<U: Read + Write> Tf03<U> {
         Ok(())
     }
 
-    /// Sends a command and waits for the TF03's answer to it.
-    async fn transact(&mut self, command: Command) -> Result<Response, Error<U::Error>> {
+    /// Sends a command and waits for the TF03's answer to it. `echoed` says
+    /// whether the TF03 answers by sending the command back unchanged.
+    async fn transact(
+        &mut self,
+        command: Command,
+        echoed: bool,
+    ) -> Result<Response, Error<U::Error>> {
         self.send(command).await?;
 
-        with_timeout(RESPONSE_TIMEOUT, self.await_response(command.id()))
-            .await
-            .map_err(|_| Error::Timeout)?
+        with_timeout(
+            RESPONSE_TIMEOUT,
+            self.await_response(command.id(), echoed),
+        )
+        .await
+        .map_err(|_| Error::NoReply(self.heard))?
     }
 
+    /// Sends a command, and starts over on noting what comes back.
     async fn send(&mut self, command: Command) -> Result<(), Error<U::Error>> {
+        self.sent = Some(command);
+        self.heard = Heard::Nothing;
         self.uart
             .write_all(command.as_bytes())
             .await
