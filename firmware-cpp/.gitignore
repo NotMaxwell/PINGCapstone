@@ -1,0 +1,9 @@
+# ESP-IDF build output, per-application build directories and the host tests.
+build/
+# Fetched by the component manager from components/ping/idf_component.yml;
+# dependencies.lock pins what was fetched and is committed.
+managed_components/
+# Generated from sdkconfig.defaults on the first build.
+sdkconfig
+sdkconfig.old
+.cache/

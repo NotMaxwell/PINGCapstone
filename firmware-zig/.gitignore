@@ -1,0 +1,11 @@
+# ESP-IDF build output, one directory per application.
+build/
+# Fetched by the component manager from main/idf_component.yml;
+# dependencies.lock pins what was fetched and is committed.
+managed_components/
+# Generated from sdkconfig.defaults on the first build.
+sdkconfig
+sdkconfig.old
+# Zig's caches and the host test output.
+.zig-cache/
+zig-out/

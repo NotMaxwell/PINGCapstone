@@ -1,0 +1,20 @@
+# Libraries pulled in rather than written here. The ESP-IDF component manager
+# fetches them into managed_components/ on the first build.
+dependencies:
+  idf: ">=6.0"
+
+  # u-blox's UBX protocol: framing, CFG-VALSET and NAV-PVT decoding. The v4
+  # line is a native ESP-IDF component, no Arduino core needed.
+  sparkfun/sparkfun_u-blox_gnss_v4: "^4.1.1"
+
+  # BNO08x over SPI, built on CEVA's own SH-2 reference library. Not on the
+  # registry and not tagged, so pinned to a commit.
+  esp32_BNO08x:
+    git: https://github.com/myles-parfeniuk/esp32_BNO08x.git
+    version: fdb99db225fc28f17de0d430a486c182aef927a2
+
+  # Monochrome display library: SH1106 and SSD1306 controllers and the fonts.
+  # Upstream ships its own idf_component_register.
+  u8g2:
+    git: https://github.com/olikraus/u8g2.git
+    version: 2.37.1

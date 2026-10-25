@@ -1,0 +1,12 @@
+# Libraries pulled in rather than written here. The ESP-IDF component manager
+# fetches them into managed_components/ on the first build. CEVA's SH-2 driver
+# and ubxlib's UBX protocol are vendored under components/ instead: neither
+# ships as an ESP-IDF component.
+dependencies:
+  idf: ">=6.0"
+
+  # Monochrome display library: SH1106 and SSD1306 controllers and the fonts.
+  # Upstream ships its own idf_component_register.
+  u8g2:
+    git: https://github.com/olikraus/u8g2.git
+    version: 2.37.1

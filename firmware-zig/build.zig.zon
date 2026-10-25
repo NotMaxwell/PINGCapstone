@@ -1,0 +1,14 @@
+.{
+    .name = .ping_firmware,
+    .version = "0.1.0",
+    .fingerprint = 0x2cc748a2994cfd08,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "components",
+        "main",
+    },
+}

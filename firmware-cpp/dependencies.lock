@@ -1,0 +1,39 @@
+dependencies:
+  esp32_BNO08x:
+    component_hash: ab3b9e61951518c8bc2f1ec113974d7f43fc181011b752a1a16b65f090b3297b
+    dependencies: []
+    source:
+      git: https://github.com/myles-parfeniuk/esp32_BNO08x.git
+      path: .
+      type: git
+    version: fdb99db225fc28f17de0d430a486c182aef927a2
+  idf:
+    source:
+      type: idf
+    version: 6.2.0
+  sparkfun/sparkfun_u-blox_gnss_v4:
+    component_hash: da722d4c2bf6dd91d948b3c1eaf5c543918cbaaf2ecc0f596bcec9a76983ef7e
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 4.1.1
+  u8g2:
+    component_hash: 3bab4dc37d8ffebb4a0e3bc3a48401188137da079ec0c8a34e5153c6185ec52d
+    dependencies: []
+    source:
+      git: https://github.com/olikraus/u8g2.git
+      path: .
+      type: git
+    version: 414efcdb7a908667ea461c9e3a3a31da14fc4ea5
+direct_dependencies:
+- esp32_BNO08x
+- idf
+- sparkfun/sparkfun_u-blox_gnss_v4
+- u8g2
+manifest_hash: 2df955abd826d05f06e0674050348b9f5f1a33707c197fb0a8bb62df0ef53952
+target: esp32s3
+version: 3.0.0

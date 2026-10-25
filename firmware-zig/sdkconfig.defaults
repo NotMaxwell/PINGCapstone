@@ -1,0 +1,17 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# ESP32-S3-DevKitC-1-N8R8: 8 MB flash, 8 MB octal PSRAM.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# A 1 ms tick, so the IMU task's 1 ms waits for the hub's INT line are 1 ms.
+CONFIG_FREERTOS_HZ=1000
+
+# Logs and the target lines both go out the USB port the board is flashed
+# through; UART0 stays free.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
