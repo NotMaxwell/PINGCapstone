@@ -1,13 +1,21 @@
 //! Standalone demo binary for the BNO085 driver.
 //!
 //! Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
-//! shows the orientation as yaw, pitch and roll on the display and over RTT,
-//! five times a second. Kept separate from `main.rs` so the application entry
-//! point stays clear of sensor bring-up code.
+//! shows the compass heading on the display and over RTT, five times a
+//! second. Kept separate from `main.rs` so the application entry point stays
+//! clear of sensor bring-up code.
 //!
-//! The angles are those of the breakout itself, with its printed +Y axis as
-//! forward; see [`Quaternion::to_euler`]. Yaw is from magnetic north.
+//! The heading is the direction [`LIDAR_BORESIGHT`] points, worked out the
+//! same way the application aims, by [`Aim::from_orientation`]. It is shown
+//! from true north, using [`MAGNETIC_DECLINATION_DEG`], with the nearest of
+//! the 16 compass points, and again from magnetic north. The hub fuses the
+//! accelerometer with the magnetometer, so the heading holds while the device
+//! is tilted. Pitch and roll are those of the breakout itself; see
+//! [`Quaternion::to_euler`].
 //!
+//! [`LIDAR_BORESIGHT`]: ping_capstone::constants::LIDAR_BORESIGHT
+//! [`MAGNETIC_DECLINATION_DEG`]: ping_capstone::constants::MAGNETIC_DECLINATION_DEG
+//! [`Aim::from_orientation`]: ping_capstone::geo::Aim::from_orientation
 //! [`Quaternion::to_euler`]: ping_capstone::bno085::Quaternion::to_euler
 
 #![no_std]
@@ -157,7 +165,10 @@ mod imu {
     use esp_hal::i2c::master::I2c;
     use esp_hal::spi::master::Spi;
     use ping_capstone::bno085::{Accuracy, Bno085, SensorData, SensorId, SpiTransport};
-    use ping_capstone::constants::{IMU_REPORT_INTERVAL_US, LCD_REFRESH, RETRY_DELAY};
+    use ping_capstone::constants::{
+        IMU_REPORT_INTERVAL_US, LCD_REFRESH, LIDAR_BORESIGHT, MAGNETIC_DECLINATION_DEG, RETRY_DELAY,
+    };
+    use ping_capstone::geo::Aim;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
 
@@ -196,6 +207,20 @@ mod imu {
                 return;
             }
         }
+    }
+
+    /// The nearest of the 16 points of the compass to `bearing_deg`, degrees
+    /// clockwise from north.
+    fn compass_point(bearing_deg: f32) -> &'static str {
+        const POINTS: [&str; 16] = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+            "NW", "NNW",
+        ];
+        // Each point covers 22.5°, centred on its own bearing. The cast
+        // truncates towards zero and saturates, so a bearing a hair below
+        // zero still lands on north.
+        let sector = (bearing_deg / 22.5 + 0.5) as usize;
+        POINTS[sector % POINTS.len()]
     }
 
     /// Whether it is time to show the next reading, at most once every
@@ -296,6 +321,14 @@ mod imu {
                             continue;
                         }
 
+                        let heading = Aim::from_orientation(
+                            &quaternion,
+                            LIDAR_BORESIGHT,
+                            MAGNETIC_DECLINATION_DEG,
+                        )
+                        .azimuth_deg;
+                        let magnetic =
+                            Aim::from_orientation(&quaternion, LIDAR_BORESIGHT, 0.0).azimuth_deg;
                         let angles = quaternion.to_euler();
                         let accuracy = match event.accuracy {
                             Accuracy::High => "high",
@@ -306,9 +339,12 @@ mod imu {
                         show(
                             &mut lcd,
                             &[
-                                format_args!("yaw   {:>7.1}°", angles.yaw_deg),
-                                format_args!("pitch {:>+7.1}°", angles.pitch_deg),
-                                format_args!("roll  {:>+7.1}°", angles.roll_deg),
+                                format_args!("hdg {:>6.1}° {}", heading, compass_point(heading)),
+                                format_args!("mag {:>6.1}°", magnetic),
+                                format_args!(
+                                    "p{:>+6.1} r{:>+7.1}",
+                                    angles.pitch_deg, angles.roll_deg
+                                ),
                                 format_args!("acc {} ±{:.1}°", accuracy, accuracy_rad.to_degrees()),
                             ],
                         )
