@@ -217,7 +217,7 @@ pub const Display = struct {
     /// at power or wiring, and a device somewhere else is usually the display
     /// at another address.
     pub fn scan(display: *Display) Addresses {
-        var found: Addresses = .initEmpty();
+        var found: Addresses = .empty;
         var address: u16 = 0x08;
         while (address <= 0x77) : (address += 1) {
             if (idf.i2c_master_probe(display.bus, address, i2c_timeout_ms) == idf.ESP_OK) found.set(address);

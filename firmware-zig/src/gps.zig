@@ -51,7 +51,9 @@ pub const Gps = struct {
     pub fn begin(gps: *Gps, tx: idf.gpio_num_t, rx: idf.gpio_num_t, baud: c_int) rtos.EspError!void {
         try rtos.check(idf.uart_driver_install(gps.port, rx_ring_buffer, 0, 0, null, 0));
         try rtos.check(idf.ping_uart_config_8n1(gps.port, baud));
-        try rtos.check(idf.uart_set_pin(gps.port, tx, rx, idf.UART_PIN_NO_CHANGE, idf.UART_PIN_NO_CHANGE));
+        // uart_set_pin is a variadic macro translate-c cannot follow; this is
+        // the four-pin function it picks.
+        try rtos.check(idf._uart_set_pin4(gps.port, tx, rx, idf.UART_PIN_NO_CHANGE, idf.UART_PIN_NO_CHANGE));
     }
 
     /// Asks the receiver what it is and waits for the answer. Also a cheap

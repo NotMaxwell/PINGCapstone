@@ -263,7 +263,7 @@ pub const Imu = struct {
     fn halOpen(self: [*c]sh2.sh2_Hal_t) callconv(.c) c_int {
         const imu = fromHal(self);
         imu.pending_len = 0;
-        sh2.sh2_setSensorCallback(onSensorEvent, imu);
+        _ = sh2.sh2_setSensorCallback(onSensorEvent, imu);
 
         gpio.write(constants.imu_cs, 1);
         gpio.write(constants.imu_wake, 1);

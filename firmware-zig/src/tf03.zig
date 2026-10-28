@@ -186,7 +186,9 @@ pub const Tf03 = struct {
     pub fn begin(lidar: *Tf03, tx: idf.gpio_num_t, rx: idf.gpio_num_t, baud: c_int) rtos.EspError!void {
         try rtos.check(idf.uart_driver_install(lidar.port, rx_ring_buffer, 0, 0, null, 0));
         try rtos.check(idf.ping_uart_config_8n1(lidar.port, baud));
-        try rtos.check(idf.uart_set_pin(lidar.port, tx, rx, idf.UART_PIN_NO_CHANGE, idf.UART_PIN_NO_CHANGE));
+        // uart_set_pin is a variadic macro translate-c cannot follow; this is
+        // the four-pin function it picks.
+        try rtos.check(idf._uart_set_pin4(lidar.port, tx, rx, idf.UART_PIN_NO_CHANGE, idf.UART_PIN_NO_CHANGE));
     }
 
     /// A human readable description of `err`, as the driver last saw it, for
