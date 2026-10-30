@@ -1,0 +1,36 @@
+PING Pin Map · ESP32-S3-DevKitC-1-N8R8,,,,,,,,
+"Every sensor wires to the left header (J1). Board TX goes to sensor RX, board RX to sensor TX. All grounds are common.",,,,,,,,
+,,,,,,,,
+Device,Device pin / wire,Board connection,J1 position,Interface,Direction,Level,Required,Reasoning
+TF03-100 LiDAR,Red (VCC),"Fused 12V line, after D1",—,Power,—,5–24V,Yes,The current TF03-series datasheet allows 5–24V. Taking power before the buck keeps the LiDAR's 480 mA peak off the board's regulator.
+TF03-100 LiDAR,Black (GND),Common ground,J1-22 (G),Power,—,0V,Yes,Serial signals only make sense if both ends share a ground.
+TF03-100 LiDAR,"Blue (UART RxD, sensor RX)",GPIO17,J1-10,"UART1 TX, 115200 8N1",Board → sensor,3.3V,Yes,"GPIO17 is UART1's dedicated TX pin, which gives the cleanest timing. Board TX goes to sensor RX."
+TF03-100 LiDAR,"Brown (UART TxD, sensor TX)",GPIO18,J1-11,"UART1 RX, 115200 8N1",Sensor → board,3.3V,Yes,"UART1's dedicated RX pin, the partner of GPIO17. The manual says not to leave TX or RX floating."
+TF03-100 LiDAR,"White (CAN_L), Green (CAN_H)",Not connected,—,—,—,—,No,"White/green are the CAN pair, not needed for UART. UART was chosen over CAN because CAN needs an extra transceiver chip. Colours follow the 5–24V version's six-wire cable (2024 TF03 UART/CAN manual); the old 5V version used brown RxD / yellow TxD."
+NEO-M9N GPS,VCC,3V3,J1-1 (3V3),Power,—,2.7–3.6V,Yes,"The module has no overvoltage protection, so it must never see 5V."
+NEO-M9N GPS,GND,Common ground,J1-22 (G),Power,—,0V,Yes,Shared reference for the serial lines.
+NEO-M9N GPS,RXD,GPIO15,J1-8,"UART2 TX, 38400 8N1",Board → GPS,3.3V,Yes,"UART0 belongs to USB and UART1 to the LiDAR, so the GPS gets UART2. GPIO15 sits right before GPIO17 on J1."
+NEO-M9N GPS,TXD,GPIO16,J1-9,"UART2 RX, 38400 8N1",GPS → board,3.3V,Yes,"Partner of GPIO15. UART is the GPS's factory default, needs two wires, and keeps it off any bus the IMU uses."
+NEO-M9N GPS,TIMEPULSE,GPIO7,J1-7,GPIO input,GPS → board,3.3V,Optional,"Once-per-second pulse aligned to GPS time, for timestamping readings precisely."
+NEO-M9N GPS,RESET_N,GPIO6,J1-6,GPIO output,Board → GPS,3.3V,Optional,"Lets the firmware hard-reset the GPS if it locks up. It has an internal pull-up, so leaving it unconnected is also safe."
+NEO-M9N GPS,"D_SEL, SAFEBOOT_N",Leave open,—,—,—,—,No,The datasheet says to leave both open. Open D_SEL selects UART; SAFEBOOT_N is only for firmware recovery.
+BNO085 IMU,VDD,3V3,J1-1 (3V3),Power,—,2.4–3.6V,Yes,Rated 2.4–3.6V.
+BNO085 IMU,GND,Common ground,J1-22 (G),Power,—,0V,Yes,Shared reference for SPI.
+BNO085 IMU,H_CSN (chip select) / CS,GPIO10,J1-16,SPI2 CS (mode 3),Board → IMU,3.3V,Yes,"GPIO10–13 are SPI2's dedicated pins, giving the fastest, most reliable SPI timing, and they sit in a row on J1."
+BNO085 IMU,SA0 / MOSI / DI,GPIO11,J1-17,SPI2 MOSI,Board → IMU,3.3V,Yes,Data from the board to the IMU.
+BNO085 IMU,SCK/SCL,GPIO12,J1-18,SPI2 SCK,Board → IMU,3.3V,Yes,SPI clock. Start at 1 MHz.
+BNO085 IMU,MISO/SDA,GPIO13,J1-19,SPI2 MISO,IMU → board,3.3V,Yes,Data from the IMU to the board.
+BNO085 IMU,H_INTN (interrupt),GPIO14,J1-20,"GPIO input, active low",IMU → board,3.3V,Yes,"Goes low when the IMU has data waiting, so the board reads only when there's something to read. Required in SPI mode."
+BNO085 IMU,NRST (reset),GPIO9,J1-15,"GPIO output, active low",Board → IMU,3.3V,Yes,Lets the board restart the IMU cleanly.
+BNO085 IMU,PS0 / WAKE,GPIO8,J1-12,GPIO output,Board → IMU,3.3V,Yes,"Held high through reset to select SPI mode, then pulsed low to wake the IMU."
+BNO085 IMU,PS1,3V3,J1-1 (3V3),Strap,—,3.3V,Yes,"PS0 and PS1 both high selects SPI. SPI avoids I2C clock stretching, which the ESP32 handles poorly."
+Trigger button,One side,GPIO4,J1-4,"GPIO input, internal pull-up",Button → board,3.3V,Yes,"First free pin on J1 and not a strapping pin, so a press during power-up can't change how the board boots."
+Trigger button,Other side,Common ground,J1-22 (G),—,—,0V,Yes,The internal pull-up holds GPIO4 high; a press pulls it low. No external resistor needed.
+I2C LCD,VCC,3V3,J1-2 (3V3),Power,—,3.3V,Yes,"Runs at 3.3V, so its pull-ups sit at 3.3V and the I2C lines connect straight to the board. Confirm the module is rated for 3.3V; a 5V backpack would pull the lines to 5V."
+I2C LCD,GND,Common ground,J1-22 (G),Power,—,0V,Yes,Shared reference for I2C.
+I2C LCD,SDA,GPIO1,J3-4,"I2C0 SDA, 100 kHz",Both ways,3.3V,Yes,"GPIO1 and GPIO2 sit side by side on J3 with no other job. The LCD gets its own I2C bus, separate from the IMU's SPI lines."
+I2C LCD,SCL,GPIO2,J3-5,"I2C0 SCL, 100 kHz",Board → LCD,3.3V,Yes,100 kHz is the PCF8574's maximum I2C speed. Default address 0x27 (0x3F on PCF8574A backpacks).
+Power,Buck output (5.1V),5V pin,J1-21 (5V),Power in,—,5.1V,Yes,"Feeds the board, whose own regulator makes 3.3V for the GPS, IMU and LCD. 5.1V leaves headroom for drop in the wires."
+Power,3V3 output,"GPS VCC, IMU VDD, IMU PS1, LCD VCC",J1-1 (3V3),Power out,—,3.3V,Yes,"Combined draw of the GPS, IMU and LCD backlight is about 0.14 A, within the board regulator's capacity."
+Power,Ground,"Battery −, buck, every board",J1-22 (G),Power,—,0V,Yes,One shared ground for every device.
+Power,Fuse F1 and diode D1,"At the battery, ahead of the LiDAR and buck",—,Protection,—,12V,Yes,F1 protects every wire after it. D1 stops a reversed battery from reaching the LiDAR or the buck.
