@@ -22,15 +22,16 @@
 //! GPS state, and after each press the target's coordinate for
 //! [`TARGET_HOLD`].
 //!
-//! Before trusting the bearings, set [`LIDAR_BORESIGHT`] to how the LiDAR is
-//! mounted against the IMU, [`MAGNETIC_DECLINATION_DEG`] to where the device
-//! is used and [`HEADING_OFFSET_DEG`] to whatever error is left after that.
-//! All three live in [`ping_capstone::constants`], with the pin map and every
-//! other fixed setting.
+//! The bearings are the IMU's own, which it measures from magnetic north,
+//! until [`HEADING_CORRECTION_DEG`] has been measured and set: nothing here
+//! guesses at that correction from a magnetic model. The `heading_cal` binary
+//! measures it against bearings that are known, and
+//! `docs/heading-calibration.md` is the procedure. [`LIDAR_BORESIGHT`] says
+//! how the LiDAR is mounted against the IMU. Both live in
+//! [`ping_capstone::constants`], with the pin map and every other fixed
+//! setting.
 //!
-//! [`MAGNETIC_DECLINATION_DEG`]: ping_capstone::constants::MAGNETIC_DECLINATION_DEG
 //! [`TARGET_HOLD`]: ping_capstone::constants::TARGET_HOLD
-//! [`HEADING_OFFSET_DEG`]: ping_capstone::constants::HEADING_OFFSET_DEG
 
 #![no_std]
 #![no_main]

@@ -235,29 +235,28 @@ pub const LIDAR_BORESIGHT: Vec3 = Vec3 {
     z: 0.0,
 };
 
-/// How far magnetic north lies east of true north where the device is used,
-/// in degrees, negative for west. The IMU measures bearings from magnetic
-/// north, but coordinates are laid out from true north. Look the value up at
-/// <https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml>.
+/// Everything added to the heading the IMU reports, in degrees, positive to
+/// turn the bearing clockwise.
 ///
-/// Set for Huntsville, Alabama: 4.3° west from the World Magnetic Model
-/// (WMM2025) for late 2026. It drifts by about a tenth of a degree a year.
-pub const MAGNETIC_DECLINATION_DEG: f32 = -4.3;
-
-/// A fixed trim added to every heading, in degrees, positive to turn it
-/// clockwise. It absorbs whatever stays constant once the declination is
-/// right: the IMU breakout sitting a little crooked against the direction
-/// the LiDAR looks, or a magnetometer bias the hub's calibration leaves
-/// behind. Keep it separate from [`MAGNETIC_DECLINATION_DEG`], which is a
-/// property of the place, not the device.
+/// Zero, as it stands, means the bearings the device reports are the IMU's
+/// own, with nothing added. The rotation vector takes its heading from the
+/// magnetometer, so those are bearings from *magnetic* north: around
+/// Huntsville that is some 4° off true north, which moves a target about 7 m
+/// sideways at 100 m of range.
 ///
-/// Measure it only once `compass_diag` shows the field at Earth's strength
-/// and dip, and set it to the average error over several headings: an error
-/// that changes with heading is magnetic interference, which no trim fixes.
-pub const HEADING_OFFSET_DEG: f32 = 0.0;
-
-/// Everything added to the IMU's magnetic heading to get a true bearing.
-pub const HEADING_CORRECTION_DEG: f32 = MAGNETIC_DECLINATION_DEG + HEADING_OFFSET_DEG;
+/// This is one measured number rather than a magnetic model plus a trim. The
+/// error between what the device reports and a bearing that is known is the
+/// declination where the device is used, the IMU breakout sitting crooked
+/// against the direction the LiDAR looks, and whatever hard iron bias the
+/// hub's calibration leaves behind, all at once; nothing on the device can
+/// tell them apart, and only their sum changes a coordinate. Measuring the
+/// sum against known bearings is also the only form of it that can be checked
+/// against reality.
+///
+/// The `heading_cal` binary measures it and prints the value to put here.
+/// `docs/heading-calibration.md` is the procedure, and what to do when the
+/// error turns out not to be a constant.
+pub const HEADING_CORRECTION_DEG: f32 = 0.0;
 
 /// Where the device is taken to be while the GPS has no fix, so it can be
 /// tried out before the GPS has an antenna. A live fix is always used when
