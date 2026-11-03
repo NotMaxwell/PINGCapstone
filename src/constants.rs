@@ -87,6 +87,7 @@
 use embassy_time::Duration;
 
 use crate::bno085::Vec3;
+use crate::geo::Position;
 
 /// Takes the GPIO wired to a named signal out of esp-hal's `Peripherals`.
 ///
@@ -238,7 +239,47 @@ pub const LIDAR_BORESIGHT: Vec3 = Vec3 {
 /// in degrees, negative for west. The IMU measures bearings from magnetic
 /// north, but coordinates are laid out from true north. Look the value up at
 /// <https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml>.
-pub const MAGNETIC_DECLINATION_DEG: f32 = 0.0;
+///
+/// Set for Huntsville, Alabama: 4.3° west from the World Magnetic Model
+/// (WMM2025) for late 2026. It drifts by about a tenth of a degree a year.
+pub const MAGNETIC_DECLINATION_DEG: f32 = -4.3;
+
+/// A fixed trim added to every heading, in degrees, positive to turn it
+/// clockwise. It absorbs whatever stays constant once the declination is
+/// right: the IMU breakout sitting a little crooked against the direction
+/// the LiDAR looks, or a magnetometer bias the hub's calibration leaves
+/// behind. Keep it separate from [`MAGNETIC_DECLINATION_DEG`], which is a
+/// property of the place, not the device.
+///
+/// Measure it only once `compass_diag` shows the field at Earth's strength
+/// and dip, and set it to the average error over several headings: an error
+/// that changes with heading is magnetic interference, which no trim fixes.
+pub const HEADING_OFFSET_DEG: f32 = 0.0;
+
+/// Everything added to the IMU's magnetic heading to get a true bearing.
+pub const HEADING_CORRECTION_DEG: f32 = MAGNETIC_DECLINATION_DEG + HEADING_OFFSET_DEG;
+
+/// Where the device is taken to be while the GPS has no fix, so it can be
+/// tried out before the GPS has an antenna. A live fix is always used when
+/// there is one, and every coordinate worked out from this position says so.
+/// Set it to where the device is used; a phone's map app gives latitude and
+/// longitude to plenty of digits. Once the antenna is fitted, set it to
+/// `None` so that a press without a fix reports no coordinate rather than
+/// one from the wrong place.
+///
+/// The default is a made-up point for checking the projection math: round
+/// numbers, so a target's offset reads straight off its coordinate, and far
+/// enough from the equator (at 40° N a degree of longitude is 85 km against
+/// 111 km for latitude) that a mix-up between the two shows.
+pub const FALLBACK_POSITION: Option<Position> = Some(Position {
+    latitude_deg: 40.0,
+    longitude_deg: -90.0,
+    altitude_m: 200.0,
+});
+
+/// How often the IMU task logs the compass bearing over RTT, so the
+/// magnetometer can be watched calibrating.
+pub const COMPASS_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -274,6 +315,10 @@ pub const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
 /// bus for about 25 ms, and a reading that changes faster than this is a blur
 /// anyway.
 pub const LCD_REFRESH: Duration = Duration::from_millis(200);
+
+/// How long the main program's display shows a press's result before going
+/// back to the live readings.
+pub const TARGET_HOLD: Duration = Duration::from_secs(10);
 
 /// How long to wait before retrying a sensor that failed to come up.
 pub const RETRY_DELAY: Duration = Duration::from_secs(1);

@@ -1,13 +1,25 @@
 //! Standalone demo binary for the BNO085 driver.
 //!
 //! Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
-//! shows the orientation as yaw, pitch and roll on the display and over RTT,
-//! five times a second. Kept separate from `main.rs` so the application entry
-//! point stays clear of sensor bring-up code.
+//! shows, on the display and over RTT five times a second, the compass
+//! heading and elevation of the direction the LiDAR points, the roll of the
+//! breakout, and how far the hub trusts its compass. Kept separate from
+//! `main.rs` so the application entry point stays clear of sensor bring-up
+//! code.
 //!
-//! The angles are those of the breakout itself, with its printed +Y axis as
-//! forward; see [`Quaternion::to_euler`]. Yaw is from magnetic north.
+//! The heading and elevation are worked out exactly as `main.rs` does, from
+//! [`LIDAR_BORESIGHT`] and [`HEADING_CORRECTION_DEG`] (the declination plus
+//! a fixed trim), so the demo shows the bearing a button press would use. Roll is that of the breakout itself, with
+//! its printed +Y axis as forward; see [`Quaternion::to_euler`].
 //!
+//! The rotation vector takes its heading from the magnetometer, so it is a
+//! compass bearing rather than a turn from where the device started, but
+//! only once the magnetometer is calibrated: until the accuracy reads high,
+//! move the device in a slow figure of eight. The calibration is then saved
+//! to the hub so the next boot starts from it.
+//!
+//! [`LIDAR_BORESIGHT`]: ping_capstone::constants::LIDAR_BORESIGHT
+//! [`HEADING_CORRECTION_DEG`]: ping_capstone::constants::HEADING_CORRECTION_DEG
 //! [`Quaternion::to_euler`]: ping_capstone::bno085::Quaternion::to_euler
 
 #![no_std]
@@ -157,7 +169,10 @@ mod imu {
     use esp_hal::i2c::master::I2c;
     use esp_hal::spi::master::Spi;
     use ping_capstone::bno085::{Accuracy, Bno085, SensorData, SensorId, SpiTransport};
-    use ping_capstone::constants::{IMU_REPORT_INTERVAL_US, LCD_REFRESH, RETRY_DELAY};
+    use ping_capstone::constants::{
+        HEADING_CORRECTION_DEG, IMU_REPORT_INTERVAL_US, LCD_REFRESH, LIDAR_BORESIGHT, RETRY_DELAY,
+    };
+    use ping_capstone::geo::Aim;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
 
@@ -210,6 +225,16 @@ mod imu {
         true
     }
 
+    /// The nearest of the sixteen compass points to `bearing_deg`.
+    fn compass_point(bearing_deg: f32) -> &'static str {
+        const POINTS: [&str; 16] = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+            "NW", "NNW",
+        ];
+        // Each point covers 22.5°, centred on its own bearing.
+        POINTS[((bearing_deg / 22.5 + 0.5) as usize) % POINTS.len()]
+    }
+
     /// Reads orientation from the BNO085 and shows it.
     ///
     /// The sensor pulls INT low when it has something to say, and holds it low
@@ -254,10 +279,16 @@ mod imu {
             }
         }
 
-        if let Err(error) = imu
-            .enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
-            .await
-        {
+        // The hub calibrates the accelerometer and magnetometer by default;
+        // asking for it makes sure, whatever an earlier program left set.
+        let started = match imu.configure_calibration(true, false, true).await {
+            Ok(()) => {
+                imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = started {
             show(
                 &mut lcd,
                 &[
@@ -270,6 +301,9 @@ mod imu {
             return;
         }
 
+        // Saved once, the first time the hub is confident in its
+        // calibration, so the next boot starts from it.
+        let mut calibration_saved = false;
         let mut next_refresh = Instant::now();
         loop {
             if let Err(error) = imu.wait_for_data().await {
@@ -292,24 +326,47 @@ mod imu {
                         else {
                             continue;
                         };
+                        if event.accuracy == Accuracy::High && !calibration_saved {
+                            calibration_saved = true;
+                            match imu.save_calibration().await {
+                                Ok(()) => rprintln!("Compass calibrated; saved to the IMU"),
+                                Err(error) => {
+                                    rprintln!("Saving the compass calibration failed: {:?}", error)
+                                }
+                            }
+                        }
                         if !due(&mut next_refresh) {
                             continue;
                         }
 
-                        let angles = quaternion.to_euler();
-                        let accuracy = match event.accuracy {
-                            Accuracy::High => "high",
-                            Accuracy::Medium => "med",
-                            Accuracy::Low => "low",
-                            Accuracy::Unreliable => "bad",
+                        let aim = Aim::from_orientation(
+                            &quaternion,
+                            LIDAR_BORESIGHT,
+                            HEADING_CORRECTION_DEG,
+                        );
+                        let roll_deg = quaternion.to_euler().roll_deg;
+                        let (accuracy, hint) = match event.accuracy {
+                            Accuracy::High => ("high", ""),
+                            Accuracy::Medium => ("med", " fig8"),
+                            Accuracy::Low => ("low", " fig8"),
+                            Accuracy::Unreliable => ("bad", " fig8"),
                         };
                         show(
                             &mut lcd,
                             &[
-                                format_args!("yaw   {:>7.1}°", angles.yaw_deg),
-                                format_args!("pitch {:>+7.1}°", angles.pitch_deg),
-                                format_args!("roll  {:>+7.1}°", angles.roll_deg),
-                                format_args!("acc {} ±{:.1}°", accuracy, accuracy_rad.to_degrees()),
+                                format_args!(
+                                    "hdg {:.1}° {}",
+                                    aim.azimuth_deg,
+                                    compass_point(aim.azimuth_deg)
+                                ),
+                                format_args!("elev {:>+7.1}°", aim.elevation_deg),
+                                format_args!("roll {:>+7.1}°", roll_deg),
+                                format_args!(
+                                    "{} ±{:.0}°{}",
+                                    accuracy,
+                                    accuracy_rad.to_degrees(),
+                                    hint
+                                ),
                             ],
                         )
                         .await;

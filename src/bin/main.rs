@@ -11,15 +11,26 @@
 //!
 //! When the button is pressed, the main task takes the latest reading from
 //! each and walks the LiDAR's range out from the GPS position along that
-//! direction (see [`ping_capstone::geo`]). The result goes to the USB serial
-//! port, one line per press, where any serial monitor on the computer at the
-//! other end of the cable shows it. Each line is also echoed over RTT
-//! alongside the diagnostics, as in the demo binaries.
+//! direction (see [`ping_capstone::geo`]). Without a GPS fix it walks out
+//! from [`FALLBACK_POSITION`] instead, if one is set, and says so on the
+//! line. The result goes to the USB serial port, one line per press, where
+//! any serial monitor on the computer at the other end of the cable shows
+//! it. Each line is also echoed over RTT alongside the diagnostics, as in
+//! the demo binaries.
+//!
+//! The display shows the live heading, compass calibration, LiDAR range and
+//! GPS state, and after each press the target's coordinate for
+//! [`TARGET_HOLD`].
 //!
 //! Before trusting the bearings, set [`LIDAR_BORESIGHT`] to how the LiDAR is
-//! mounted against the IMU and [`MAGNETIC_DECLINATION_DEG`] to where the
-//! device is used. Both live in [`ping_capstone::constants`], with the pin map
-//! and every other fixed setting.
+//! mounted against the IMU, [`MAGNETIC_DECLINATION_DEG`] to where the device
+//! is used and [`HEADING_OFFSET_DEG`] to whatever error is left after that.
+//! All three live in [`ping_capstone::constants`], with the pin map and every
+//! other fixed setting.
+//!
+//! [`MAGNETIC_DECLINATION_DEG`]: ping_capstone::constants::MAGNETIC_DECLINATION_DEG
+//! [`TARGET_HOLD`]: ping_capstone::constants::TARGET_HOLD
+//! [`HEADING_OFFSET_DEG`]: ping_capstone::constants::HEADING_OFFSET_DEG
 
 #![no_std]
 #![no_main]
@@ -41,6 +52,7 @@ use embedded_io_async::Write;
 use esp_hal::Async;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::spi::Mode as SpiMode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
@@ -49,11 +61,13 @@ use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use ping_capstone::bno085::{Accuracy, Bno085, Quaternion, SpiTransport};
 use ping_capstone::constants::{
-    DEBOUNCE, GPS_BAUD_RATE, HEAP_SIZE, IMU_SPI_FREQUENCY_KHZ, LIDAR_BAUD_RATE, LIDAR_BORESIGHT,
-    MAGNETIC_DECLINATION_DEG, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, SERIAL_TIMEOUT,
+    DEBOUNCE, FALLBACK_POSITION, GPS_BAUD_RATE, HEADING_CORRECTION_DEG, HEAP_SIZE,
+    IMU_SPI_FREQUENCY_KHZ, LCD_ADDRESS, LCD_COLUMN_OFFSET, LCD_I2C_FREQUENCY_KHZ, LIDAR_BAUD_RATE,
+    LIDAR_BORESIGHT, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, SERIAL_TIMEOUT,
 };
 use ping_capstone::geo::{Aim, Position};
 use ping_capstone::neo_m9n::{FixType, NeoM9n, Solution};
+use ping_capstone::ssd1306::Ssd1306;
 use ping_capstone::tf03::{Measurement, Tf03};
 use ping_capstone::{board_bus, board_pin};
 use rtt_target::rprintln;
@@ -167,9 +181,22 @@ async fn main(spawner: Spawner) -> ! {
     // serial port, /dev/cu.usbmodem* on macOS or a COM port on Windows.
     let mut serial = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
 
+    // Display: the OLED on I2C0. The display task brings it up, and keeps
+    // trying if it is missing, so a loose display never holds up the rest.
+    let lcd_i2c = I2c::new(
+        board_bus!(peripherals.LCD_I2C),
+        I2cConfig::default().with_frequency(Rate::from_khz(LCD_I2C_FREQUENCY_KHZ)),
+    )
+    .expect("Failed to configure the display I2C bus")
+    .with_sda(board_pin!(peripherals.LCD_SDA))
+    .with_scl(board_pin!(peripherals.LCD_SCL))
+    .into_async();
+    let lcd = Ssd1306::new(lcd_i2c, LCD_ADDRESS, LCD_COLUMN_OFFSET);
+
     spawner.spawn(gps_task(NeoM9n::new(gps_uart)).expect("Failed to spawn the GPS task"));
     spawner.spawn(imu_task(Bno085::new(imu, Delay)).expect("Failed to spawn the IMU task"));
     spawner.spawn(lidar_task(Tf03::new(lidar_uart)).expect("Failed to spawn the LiDAR task"));
+    spawner.spawn(display_task(lcd).expect("Failed to spawn the display task"));
 
     let mut presses: u32 = 0;
     loop {
@@ -184,6 +211,7 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         presses = presses.wrapping_add(1);
+        TARGET.set((presses, sighting));
         let line = match sighting {
             Ok(sighting) => format!("target #{presses}: {sighting}"),
             Err(problem) => format!("target #{presses}: none, {problem}"),
@@ -203,28 +231,18 @@ async fn main(spawner: Spawner) -> ! {
     compiled, they share a frame of a few hundred bytes"
 )]
 fn take_sighting() -> Result<Sighting, Problem> {
-    let solution = GPS.get(MAX_GPS_AGE)?;
     let orientation = IMU.get(MAX_IMU_AGE)?;
     let measurement = LIDAR.get(MAX_LIDAR_AGE)?;
-
-    let (latitude_deg, longitude_deg) = solution.position().ok_or(Problem::NoFix {
-        fix_type: solution.fix_type,
-        satellites: solution.satellites,
-    })?;
     let distance_cm = measurement.distance_cm.ok_or(Problem::NoReturn {
         strength: measurement.strength,
     })?;
 
-    let origin = Position {
-        latitude_deg,
-        longitude_deg,
-        altitude_m: f64::from(solution.height_msl_m),
+    let (origin, source) = match (gps_position(), FALLBACK_POSITION) {
+        (Ok((origin, source)), _) => (origin, source),
+        (Err(problem), Some(fallback)) => (fallback, Source::Fallback(problem)),
+        (Err(problem), None) => return Err(problem),
     };
-    let aim = Aim::from_orientation(
-        &orientation.quaternion,
-        LIDAR_BORESIGHT,
-        MAGNETIC_DECLINATION_DEG,
-    );
+    let aim = orientation.aim();
     let range_m = f32::from(distance_cm) / 100.0;
 
     Ok(Sighting {
@@ -232,22 +250,63 @@ fn take_sighting() -> Result<Sighting, Problem> {
         origin,
         aim,
         range_m,
-        origin_accuracy_m: solution.horizontal_accuracy_m,
-        satellites: solution.satellites,
+        source,
         heading_accuracy_deg: orientation.heading_accuracy_rad.to_degrees(),
         compass: orientation.calibration,
     })
 }
 
+/// The device's own position from a recent GPS fix.
+fn gps_position() -> Result<(Position, Source), Problem> {
+    let solution = GPS.get(MAX_GPS_AGE)?;
+    let (latitude_deg, longitude_deg) = solution.position().ok_or(Problem::NoFix {
+        fix_type: solution.fix_type,
+        satellites: solution.satellites,
+    })?;
+    let origin = Position {
+        latitude_deg,
+        longitude_deg,
+        altitude_m: f64::from(solution.height_msl_m),
+    };
+    let source = Source::Gps {
+        accuracy_m: solution.horizontal_accuracy_m,
+        satellites: solution.satellites,
+    };
+    Ok((origin, source))
+}
+
+/// Where a sighting's origin came from.
+#[derive(Clone, Copy)]
+enum Source {
+    Gps {
+        /// The GPS's 1σ estimate of its horizontal error, metres.
+        accuracy_m: f32,
+        satellites: u8,
+    },
+    /// [`FALLBACK_POSITION`], because the GPS could not give a position.
+    Fallback(Problem),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gps {
+                accuracy_m,
+                satellites,
+            } => write!(f, "+/-{accuracy_m:.1} m, {satellites} satellites"),
+            Self::Fallback(problem) => write!(f, "FALLBACK POSITION, {problem}"),
+        }
+    }
+}
+
 /// A located target, and what it was located from.
+#[derive(Clone, Copy)]
 struct Sighting {
     target: Position,
     origin: Position,
     aim: Aim,
     range_m: f32,
-    /// The GPS's 1σ estimate of its horizontal error, metres.
-    origin_accuracy_m: f32,
-    satellites: u8,
+    source: Source,
     /// The IMU's estimate of its heading error, degrees.
     heading_accuracy_deg: f32,
     /// How far the IMU trusts its magnetometer calibration.
@@ -260,7 +319,7 @@ impl fmt::Display for Sighting {
             f,
             "{:.7}, {:.7}, alt {:.1} m \
              | range {:.2} m, bearing {:.1} deg, elevation {:.1} deg \
-             | from {:.7}, {:.7}, alt {:.1} m, +/-{:.1} m, {} satellites \
+             | from {:.7}, {:.7}, alt {:.1} m, {} \
              | heading +/-{:.1} deg, compass calibration {:?}",
             self.target.latitude_deg,
             self.target.longitude_deg,
@@ -271,15 +330,15 @@ impl fmt::Display for Sighting {
             self.origin.latitude_deg,
             self.origin.longitude_deg,
             self.origin.altitude_m,
-            self.origin_accuracy_m,
-            self.satellites,
+            self.source,
             self.heading_accuracy_deg,
             self.compass,
         )
     }
 }
 
-/// Why a press produced no coordinate.
+/// Why a press produced no coordinate, or why the GPS position was not used.
+#[derive(Clone, Copy)]
 enum Problem {
     /// A sensor has not reported recently, or at all.
     Stale {
@@ -355,8 +414,17 @@ struct Orientation {
     calibration: Accuracy,
 }
 
+impl Orientation {
+    /// Where the LiDAR points, as a true bearing and an elevation.
+    fn aim(&self) -> Aim {
+        Aim::from_orientation(&self.quaternion, LIDAR_BORESIGHT, HEADING_CORRECTION_DEG)
+    }
+}
+
 static GPS: Latest<Solution> = Latest::new("GPS");
 static IMU: Latest<Orientation> = Latest::new("IMU");
+/// The latest press: its number, and what it found.
+static TARGET: Latest<(u32, Result<Sighting, Problem>)> = Latest::new("target");
 static LIDAR: Latest<Measurement> = Latest::new("LiDAR");
 
 /// Sends one line to the computer over the USB serial port, if something
@@ -384,6 +452,7 @@ async fn wait_for_release(button: &mut Input<'_>) {
     }
 }
 
+use display::display_task;
 use sensors::{gps_task, imu_task, lidar_task};
 
 mod sensors {
@@ -398,15 +467,18 @@ mod sensors {
 
     use super::{GPS, IMU, LIDAR, Orientation};
     use core::convert::Infallible;
-    use embassy_time::{Delay, Timer, with_timeout};
+    use embassy_time::{Delay, Instant, Timer, with_timeout};
     use esp_hal::Async;
     use esp_hal::gpio::{Input, Output};
     use esp_hal::spi;
     use esp_hal::spi::master::Spi;
     use esp_hal::uart::Uart;
-    use ping_capstone::bno085::{self, Bno085, ProductId, SensorData, SensorId, SpiTransport};
+    use ping_capstone::bno085::{
+        self, Accuracy, Bno085, ProductId, SensorData, SensorId, SpiTransport,
+    };
     use ping_capstone::constants::{
-        GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE, RETRY_DELAY,
+        COMPASS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE,
+        RETRY_DELAY,
     };
     use ping_capstone::neo_m9n::NeoM9n;
     use ping_capstone::tf03::Tf03;
@@ -473,6 +545,10 @@ mod sensors {
                 }
             }
 
+            // Saved once per start, the first time the hub is confident in
+            // its calibration, so the next boot starts from it.
+            let mut calibration_saved = false;
+            let mut next_log = Instant::now();
             'reporting: loop {
                 match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {
                     Ok(Ok(())) => {}
@@ -494,11 +570,27 @@ mod sensors {
                                 accuracy_rad,
                             } = event.data
                             {
-                                IMU.set(Orientation {
+                                let orientation = Orientation {
                                     quaternion,
                                     heading_accuracy_rad: accuracy_rad,
                                     calibration: event.accuracy,
-                                });
+                                };
+                                IMU.set(orientation);
+
+                                if Instant::now() >= next_log {
+                                    next_log = Instant::now() + COMPASS_LOG_INTERVAL;
+                                    log_compass(&orientation);
+                                }
+                                if event.accuracy == Accuracy::High && !calibration_saved {
+                                    calibration_saved = true;
+                                    match imu.save_calibration().await {
+                                        Ok(()) => rprintln!("Compass calibrated; saved to the IMU"),
+                                        Err(error) => rprintln!(
+                                            "Saving the compass calibration failed: {:?}",
+                                            error
+                                        ),
+                                    }
+                                }
                             }
                         }
                         // Nothing left waiting; go back to the interrupt pin.
@@ -520,9 +612,33 @@ mod sensors {
     /// Resets the hub and starts its rotation vector.
     async fn start(imu: &mut Imu) -> Result<ProductId, ImuError> {
         let id = imu.init().await?;
+        // The rotation vector takes its heading from the magnetometer, so it
+        // is a compass bearing rather than a turn from where the device
+        // started, but only once the magnetometer is calibrated. The hub
+        // calibrates the accelerometer and magnetometer by default; asking
+        // for it makes sure, whatever an earlier program left set.
+        imu.configure_calibration(true, false, true).await?;
         imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
             .await?;
         Ok(id)
+    }
+
+    /// Logs where the LiDAR points by the compass, and how far the IMU
+    /// trusts it.
+    fn log_compass(orientation: &Orientation) {
+        let aim = orientation.aim();
+        rprintln!(
+            "Compass: bearing {:.1} deg, elevation {:.1} deg, heading +/-{:.1} deg, calibration {:?}{}",
+            aim.azimuth_deg,
+            aim.elevation_deg,
+            orientation.heading_accuracy_rad.to_degrees(),
+            orientation.calibration,
+            if orientation.calibration == Accuracy::High {
+                ""
+            } else {
+                " (move the device in a slow figure of eight to calibrate)"
+            }
+        );
     }
 
     /// Keeps the latest distance from the TF03.
@@ -552,6 +668,182 @@ mod sensors {
                 // on the next frame, so carry on reading.
                 Err(error) => rprintln!("TF03 read failed: {:?}", error),
             }
+        }
+    }
+}
+
+mod display {
+    //! The display task, in its own module so the stack frame lint can be
+    //! relaxed for it, as for the sensor tasks: its future lives in a static
+    //! task pool, and is mostly the I2C driver's.
+    #![allow(clippy::large_stack_frames)]
+
+    use super::{GPS, IMU, LIDAR, Problem, Source, TARGET};
+    use alloc::format;
+    use alloc::string::String;
+    use embassy_time::{Duration, Timer};
+    use esp_hal::Async;
+    use esp_hal::i2c::master::I2c;
+    use ping_capstone::bno085::Accuracy;
+    use ping_capstone::constants::{
+        LCD_REFRESH, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, TARGET_HOLD,
+    };
+    use ping_capstone::ssd1306::{ROWS, Ssd1306};
+    use rtt_target::rprintln;
+
+    type Display = Ssd1306<I2c<'static, Async>>;
+
+    /// The nearest of the sixteen compass points to `bearing_deg`.
+    fn compass_point(bearing_deg: f32) -> &'static str {
+        const POINTS: [&str; 16] = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+            "NW", "NNW",
+        ];
+        // Each point covers 22.5°, centred on its own bearing.
+        POINTS[((bearing_deg / 22.5 + 0.5) as usize) % POINTS.len()]
+    }
+
+    /// Why there is no reading or no target, in two lines short enough for
+    /// the display.
+    fn explain(problem: &Problem) -> [String; 2] {
+        match *problem {
+            Problem::Stale { sensor, age: None } => {
+                [format!("no {sensor}"), String::from("reading yet")]
+            }
+            Problem::Stale {
+                sensor,
+                age: Some(age),
+            } => [
+                format!("{sensor} silent"),
+                format!("for {:.1} s", age.as_millis() as f32 / 1000.0),
+            ],
+            Problem::NoFix { satellites, .. } => [
+                String::from("GPS no fix"),
+                format!("{satellites} satellites"),
+            ],
+            Problem::NoReturn { strength } => [
+                String::from("LiDAR: no return"),
+                format!("strength {strength}"),
+            ],
+        }
+    }
+
+    /// What to show now: the latest press for [`TARGET_HOLD`] after it,
+    /// otherwise the live readings.
+    fn screen() -> [String; ROWS] {
+        if let Ok((press, result)) = TARGET.get(TARGET_HOLD) {
+            return match result {
+                Ok(sighting) => {
+                    let target = sighting.target;
+                    [
+                        match sighting.source {
+                            Source::Gps { .. } => format!("#{press} target"),
+                            Source::Fallback(_) => format!("#{press} test origin"),
+                        },
+                        format!(
+                            "{} {:.6}",
+                            if target.latitude_deg < 0.0 { 'S' } else { 'N' },
+                            target.latitude_deg.abs()
+                        ),
+                        format!(
+                            "{} {:.6}",
+                            if target.longitude_deg < 0.0 { 'W' } else { 'E' },
+                            target.longitude_deg.abs()
+                        ),
+                        format!(
+                            "{:.1}m @ {:.0}°",
+                            sighting.range_m, sighting.aim.azimuth_deg
+                        ),
+                    ]
+                }
+                Err(problem) => {
+                    let [why, detail] = explain(&problem);
+                    [format!("#{press} no target"), why, detail, String::new()]
+                }
+            };
+        }
+
+        let (heading, calibration) = match IMU.get(MAX_IMU_AGE) {
+            Ok(orientation) => {
+                let aim = orientation.aim();
+                (
+                    format!(
+                        "hdg {:.1}° {}",
+                        aim.azimuth_deg,
+                        compass_point(aim.azimuth_deg)
+                    ),
+                    match orientation.calibration {
+                        Accuracy::High => format!(
+                            "cal high ±{:.0}°",
+                            orientation.heading_accuracy_rad.to_degrees()
+                        ),
+                        Accuracy::Medium => String::from("cal med - fig 8"),
+                        Accuracy::Low => String::from("cal low - fig 8"),
+                        Accuracy::Unreliable => String::from("cal bad - fig 8"),
+                    },
+                )
+            }
+            Err(problem) => explain(&problem).into(),
+        };
+        let range = match LIDAR.get(MAX_LIDAR_AGE) {
+            Ok(measurement) => match measurement.distance_cm {
+                Some(cm) => format!("rng {:.2} m", f32::from(cm) / 100.0),
+                None => String::from("rng: no return"),
+            },
+            Err(_) => String::from("LiDAR silent"),
+        };
+        let gps = match GPS.get(MAX_GPS_AGE) {
+            Ok(solution) => format!("GPS {:?} {}sat", solution.fix_type, solution.satellites),
+            Err(_) => String::from("GPS silent"),
+        };
+        [heading, calibration, range, gps]
+    }
+
+    /// Keeps the display up to date, [`LCD_REFRESH`] at a time.
+    #[embassy_executor::task]
+    pub async fn display_task(mut lcd: Display) {
+        // Whether the display answered last time, so a missing one is
+        // reported once rather than five times a second.
+        let mut working = false;
+        let mut reported = false;
+        loop {
+            if !working {
+                match lcd.init().await {
+                    Ok(()) => {
+                        rprintln!("Display up");
+                        working = true;
+                        reported = false;
+                    }
+                    Err(error) if !reported => {
+                        rprintln!(
+                            "Display not answering at {:#04x}: {:?}; retrying quietly",
+                            super::LCD_ADDRESS,
+                            error
+                        );
+                        reported = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            if working {
+                for (row, line) in screen().iter().enumerate() {
+                    if let Err(error) = lcd.write_line(row, line).await {
+                        rprintln!("Display write failed: {:?}; retrying quietly", error);
+                        working = false;
+                        reported = true;
+                        break;
+                    }
+                }
+            }
+
+            // A missing display is retried less often.
+            let wait = if working {
+                LCD_REFRESH
+            } else {
+                Duration::from_secs(1)
+            };
+            Timer::after(wait).await;
         }
     }
 }

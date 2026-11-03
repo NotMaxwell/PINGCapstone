@@ -463,8 +463,11 @@ impl<U: Read + Write> NeoM9n<U> {
 
         with_timeout(RESPONSE_TIMEOUT, async {
             loop {
-                if let Message::Version(version) = self.read_message().await? {
-                    return Ok(version);
+                match self.read_message().await {
+                    Ok(Message::Version(version)) => return Ok(version),
+                    // See await_ack.
+                    Ok(_) | Err(Error::Uart(_)) => {}
+                    Err(error) => return Err(error),
                 }
             }
         })
@@ -476,12 +479,21 @@ impl<U: Read + Write> NeoM9n<U> {
     /// skipping everything else.
     async fn await_ack<T: UbxPacketMeta>(&mut self) -> Result<(), Error<U::Error>> {
         loop {
-            match self.read_message().await? {
-                Message::Ack { class, id } if class == T::CLASS && id == T::ID => return Ok(()),
-                Message::Nak { class, id } if class == T::CLASS && id == T::ID => {
+            match self.read_message().await {
+                Ok(Message::Ack { class, id }) if class == T::CLASS && id == T::ID => {
+                    return Ok(());
+                }
+                Ok(Message::Nak { class, id }) if class == T::CLASS && id == T::ID => {
                     return Err(Error::Rejected);
                 }
-                _ => {}
+                // A UART error here is usually stale: the RX FIFO overflowed
+                // while nobody was reading, e.g. during a caller's retry
+                // delay, or the line glitched while the receiver restarted.
+                // The bytes lost were sent before the request, so the reply
+                // can still arrive; giving up would fail every retry the
+                // same way.
+                Ok(_) | Err(Error::Uart(_)) => {}
+                Err(error) => return Err(error),
             }
         }
     }

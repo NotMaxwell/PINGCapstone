@@ -122,11 +122,11 @@ mod gps {
 
     use core::fmt;
 
-    use embassy_time::{Instant, Timer};
+    use embassy_time::{Instant, Timer, with_timeout};
     use esp_hal::Async;
     use esp_hal::i2c::master::I2c;
     use esp_hal::uart::Uart;
-    use ping_capstone::constants::{GPS_RATE_HZ, LCD_REFRESH, RETRY_DELAY};
+    use ping_capstone::constants::{GPS_RATE_HZ, GPS_SILENCE, LCD_REFRESH, RETRY_DELAY};
     use ping_capstone::neo_m9n::NeoM9n;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
@@ -209,23 +209,44 @@ mod gps {
             }
         }
 
-        while let Err(error) = gps.configure(GPS_RATE_HZ).await {
+        // The configuration lives in the receiver's RAM, so this runs again
+        // whenever the receiver goes quiet, in case a power glitch has put it
+        // back to its factory NMEA output.
+        loop {
+            while let Err(error) = gps.configure(GPS_RATE_HZ).await {
+                show(
+                    &mut lcd,
+                    &[
+                        format_args!("GPS refused"),
+                        format_args!("config"),
+                        format_args!("{:?}", error),
+                        format_args!("retrying"),
+                    ],
+                )
+                .await;
+                Timer::after(RETRY_DELAY).await;
+            }
+
+            read_until_quiet(&mut gps, &mut lcd).await;
             show(
                 &mut lcd,
                 &[
-                    format_args!("GPS refused"),
-                    format_args!("config"),
-                    format_args!("{:?}", error),
-                    format_args!("retrying"),
+                    format_args!("GPS went quiet"),
+                    format_args!("reconfiguring"),
                 ],
             )
             .await;
-            Timer::after(RETRY_DELAY).await;
         }
+    }
 
+    /// Shows solutions until none arrives for [`GPS_SILENCE`], which usually
+    /// means the receiver has restarted and lost its configuration.
+    async fn read_until_quiet(gps: &mut NeoM9n<Uart<'static, Async>>, lcd: &mut Display) {
         let mut next_refresh = Instant::now();
         loop {
-            let reading = gps.read().await;
+            let Ok(reading) = with_timeout(GPS_SILENCE, gps.read()).await else {
+                return;
+            };
             if !due(&mut next_refresh) {
                 continue;
             }
@@ -234,7 +255,7 @@ mod gps {
                 Ok(solution) => match solution.position() {
                     Some((latitude, longitude)) => {
                         show(
-                            &mut lcd,
+                            lcd,
                             &[
                                 format_args!("lat {:+12.7}", latitude),
                                 format_args!("lon {:+12.7}", longitude),
@@ -246,7 +267,7 @@ mod gps {
                     }
                     None => {
                         show(
-                            &mut lcd,
+                            lcd,
                             &[
                                 format_args!("no fix"),
                                 format_args!("{:?}", solution.fix_type),
@@ -260,7 +281,7 @@ mod gps {
                 // the next frame, so carry on reading.
                 Err(error) => {
                     show(
-                        &mut lcd,
+                        lcd,
                         &[format_args!("GPS read failed"), format_args!("{:?}", error)],
                     )
                     .await

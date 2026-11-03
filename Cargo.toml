@@ -19,10 +19,22 @@ path = "./src/bin/main.rs"
 name = "gps_demo"
 path = "./src/bin/gps_demo.rs"
 
+# Polls the NEO-M9N for antenna, RF, satellite and configuration status to
+# find out why it has no fix.
+[[bin]]
+name = "gps_diag"
+path = "./src/bin/gps_diag.rs"
+
 # Flashes the BNO085 driver on its own, without the rest of the application.
 [[bin]]
 name = "imu_demo"
 path = "./src/bin/imu_demo.rs"
+
+# Measures the BNO085's magnetic field against Earth's and compares its
+# headings, to find out why the compass is off.
+[[bin]]
+name = "compass_diag"
+path = "./src/bin/compass_diag.rs"
 
 # Flashes the TF03 LiDAR driver on its own, without the rest of the application.
 [[bin]]
