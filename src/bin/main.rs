@@ -499,9 +499,10 @@ mod sensors {
     #[embassy_executor::task]
     pub async fn gps_task(mut gps: NeoM9n<Uart<'static, Async>>) {
         loop {
-            // The configuration lives in the receiver's RAM, so this runs
-            // again whenever the receiver goes quiet, in case a power glitch
-            // has put it back to its factory NMEA output.
+            // The configuration survives a restart only while the
+            // receiver's backup supply holds, so this runs again whenever
+            // the receiver goes quiet, in case it is back to its factory
+            // NMEA output.
             while let Err(error) = gps.configure(GPS_RATE_HZ).await {
                 rprintln!("GPS configuration failed: {:?}, retrying", error);
                 Timer::after(RETRY_DELAY).await;

@@ -6,8 +6,8 @@
 //! satellites in use. Kept separate from `main.rs` so the application entry
 //! point stays clear of sensor bring-up code.
 //!
-//! The configuration is written to the receiver's RAM only, so a power cycle
-//! puts it back to factory settings.
+//! The configuration is written to the receiver's battery-backed RAM, so it
+//! survives the receiver restarting but not a long power cut.
 
 #![no_std]
 #![no_main]
@@ -209,9 +209,9 @@ mod gps {
             }
         }
 
-        // The configuration lives in the receiver's RAM, so this runs again
-        // whenever the receiver goes quiet, in case a power glitch has put it
-        // back to its factory NMEA output.
+        // The configuration survives a restart only while the receiver's
+        // backup supply holds, so this runs again whenever the receiver goes
+        // quiet, in case it is back to its factory NMEA output.
         loop {
             while let Err(error) = gps.configure(GPS_RATE_HZ).await {
                 show(
@@ -240,7 +240,7 @@ mod gps {
     }
 
     /// Shows solutions until none arrives for [`GPS_SILENCE`], which usually
-    /// means the receiver has restarted and lost its configuration.
+    /// means the receiver has lost power and its configuration with it.
     async fn read_until_quiet(gps: &mut NeoM9n<Uart<'static, Async>>, lcd: &mut Display) {
         let mut next_refresh = Instant::now();
         loop {

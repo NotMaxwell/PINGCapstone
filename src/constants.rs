@@ -290,9 +290,9 @@ pub const MAX_GPS_AGE: Duration = Duration::from_secs(2);
 pub const MAX_IMU_AGE: Duration = Duration::from_millis(250);
 pub const MAX_LIDAR_AGE: Duration = Duration::from_millis(250);
 
-/// A GPS this long without a solution has probably lost power, and with it
-/// its configuration, which lives in RAM. The GPS task then configures it
-/// again.
+/// A GPS this long without a solution has probably lost power for longer
+/// than its backup supply lasts, and with it its configuration. The GPS task
+/// then configures it again.
 pub const GPS_SILENCE: Duration = Duration::from_secs(3);
 
 /// An IMU this long without a report has probably reset, which stops every
