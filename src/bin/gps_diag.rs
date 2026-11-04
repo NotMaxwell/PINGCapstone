@@ -12,7 +12,9 @@
 //!    power mode;
 //! 4. every two seconds polls `UBX-NAV-STATUS`, `UBX-NAV-PVT`, `UBX-MON-RF`,
 //!    `UBX-MON-SPAN` and `UBX-NAV-SAT`, which together separate "no antenna",
-//!    "antenna but no sky" and "jammed", and counts TIMEPULSE edges.
+//!    "antenna but no sky" and "jammed", and counts TIMEPULSE edges;
+//! 5. when the receiver restarts, reads back the output settings the
+//!    driver writes, to show whether battery-backed RAM carried them over.
 //!
 //! Nothing is written to the receiver except polls and VALGET requests, so
 //! its configuration is left exactly as it was.
@@ -155,6 +157,21 @@ mod diag {
         (0x10740002, "UART1OUTPROT-NMEA"),
         (0x20910007, "MSGOUT-UBX_NAV_PVT_UART1"),
     ];
+
+    /// The keys `NeoM9n::configure` writes to RAM and BBR. They are back at
+    /// factory values after a restart unless BBR kept them.
+    const OUTPUT_KEYS: &[(u32, &str)] = &[
+        (0x10730001, "UART1INPROT-UBX"),
+        (0x10740001, "UART1OUTPROT-UBX"),
+        (0x10740002, "UART1OUTPROT-NMEA"),
+        (0x20910007, "MSGOUT-UBX_NAV_PVT_UART1"),
+        (0x30210001, "RATE-MEAS"),
+        (0x30210002, "RATE-NAV"),
+    ];
+
+    /// `CFG-VALGET` layers.
+    const LAYER_RAM: u8 = 0;
+    const LAYER_BBR: u8 = 1;
 
     struct Ubx {
         uart: Uart<'static, Async>,
@@ -416,11 +433,13 @@ mod diag {
         }
     }
 
-    async fn print_config(ubx: &mut Ubx) {
-        rprintln!("Configuration (RAM layer):");
-        for &(key, name) in KEYS {
+    /// Prints `keys` as stored in `layer`. A key the layer holds no value
+    /// for is refused, so in BBR a NAK means "not saved".
+    async fn print_config(ubx: &mut Ubx, layer: u8, keys: &[(u32, &str)]) {
+        for &(key, name) in keys {
             let mut req = [0u8; 8];
-            // version 0, layer 0 (RAM), position 0, then the key.
+            // version 0, the layer, position 0, then the key.
+            req[1] = layer;
             req[4..8].copy_from_slice(&key.to_le_bytes());
             ubx.send(CFG_VALGET.0, CFG_VALGET.1, &req).await;
             match ubx.wait_for(CFG_VALGET, CFG_VALGET).await {
@@ -453,12 +472,14 @@ mod diag {
             ubx.bad_frames
         );
 
+        let mut restarted = false;
         match ubx.poll(NAV_STATUS).await {
             Ok(_) => {
                 let p = &ubx.payload;
                 let uptime = u32le(p, 12);
                 let last = LAST_UPTIME_MS.swap(uptime, Ordering::Relaxed);
                 if uptime < last {
+                    restarted = true;
                     rprintln!(
                         "!!!!! RECEIVER RESTARTED: uptime went from {} s to {} s",
                         last / 1000,
@@ -476,6 +497,10 @@ mod diag {
                 );
             }
             Err(e) => rprintln!("NAV-STATUS: {}", e),
+        }
+        if restarted {
+            rprintln!("Output settings after the restart (RAM layer):");
+            print_config(ubx, LAYER_RAM, OUTPUT_KEYS).await;
         }
 
         match ubx.poll(NAV_PVT).await {
@@ -636,7 +661,10 @@ mod diag {
         print_version(&mut ubx).await;
 
         rprintln!("== Configuration");
-        print_config(&mut ubx).await;
+        rprintln!("RAM layer:");
+        print_config(&mut ubx, LAYER_RAM, KEYS).await;
+        rprintln!("Output settings saved in battery-backed RAM (BBR):");
+        print_config(&mut ubx, LAYER_BBR, OUTPUT_KEYS).await;
 
         rprintln!("== Status, every 2 s");
         loop {
