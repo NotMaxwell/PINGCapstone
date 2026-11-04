@@ -266,15 +266,13 @@ pub const HEADING_CORRECTION_DEG: f32 = 0.0;
 /// `None` so that a press without a fix reports no coordinate rather than
 /// one from the wrong place.
 ///
-/// The default is a made-up point for checking the projection math: round
-/// numbers, so a target's offset reads straight off its coordinate, and far
-/// enough from the equator (at 40° N a degree of longitude is 85 km against
-/// 111 km for latitude) that a mix-up between the two shows.
-pub const FALLBACK_POSITION: Option<Position> = Some(Position {
-    latitude_deg: 40.0,
-    longitude_deg: -90.0,
-    altitude_m: 200.0,
-});
+/// It is `None`: every coordinate comes from a live GPS fix. For checking the
+/// projection math without one, `Some(Position { latitude_deg: 40.0,
+/// longitude_deg: -90.0, altitude_m: 200.0 })` is a good made-up point:
+/// round numbers, so a target's offset reads straight off its coordinate,
+/// and far enough from the equator (at 40° N a degree of longitude is 85 km
+/// against 111 km for latitude) that a mix-up between the two shows.
+pub const FALLBACK_POSITION: Option<Position> = None;
 
 /// How often the IMU task logs the compass bearing over RTT, so the
 /// magnetometer can be watched calibrating.
