@@ -19,7 +19,8 @@
 //! compass bearing rather than a turn from where the device started, but
 //! only once the magnetometer is calibrated: until the accuracy reads high,
 //! move the device in a slow figure of eight. The calibration is then saved
-//! to the hub so the next boot starts from it.
+//! to the hub so the next boot starts from it, and the accuracy line reads
+//! `saved` once the hub has confirmed the save.
 //!
 //! [`LIDAR_BORESIGHT`]: ping_capstone::constants::LIDAR_BORESIGHT
 //! [`HEADING_CORRECTION_DEG`]: ping_capstone::constants::HEADING_CORRECTION_DEG
@@ -285,18 +286,18 @@ mod imu {
         // The hub calibrates the accelerometer and magnetometer by default;
         // asking for it makes sure, whatever an earlier program left set.
         let started = match imu.configure_calibration(true, false, true).await {
-            Ok(()) => {
-                imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
-                    .await
-            }
-            Err(error) => Err(error),
+            Ok(()) => imu
+                .enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
+                .await
+                .map_err(|error| ("report", error)),
+            Err(error) => Err(("calibrate", error)),
         };
-        if let Err(error) = started {
+        if let Err((what, error)) = started {
             show(
                 &mut lcd,
                 &[
                     format_args!("BNO085 refused"),
-                    format_args!("to report"),
+                    format_args!("to {}", what),
                     format_args!("{:?}", error),
                 ],
             )
@@ -305,8 +306,10 @@ mod imu {
         }
 
         // Saved once, the first time the hub is confident in its
-        // calibration, so the next boot starts from it.
+        // calibration, so the next boot starts from it. A failed save is
+        // tried again after RETRY_DELAY rather than on the very next report.
         let mut calibration_saved = false;
+        let mut next_save = Instant::now();
         let mut next_refresh = Instant::now();
         loop {
             if let Err(error) = imu.wait_for_data().await {
@@ -329,12 +332,21 @@ mod imu {
                         else {
                             continue;
                         };
-                        if event.accuracy == Accuracy::High && !calibration_saved {
-                            calibration_saved = true;
+                        if event.accuracy == Accuracy::High
+                            && !calibration_saved
+                            && Instant::now() >= next_save
+                        {
                             match imu.save_calibration().await {
-                                Ok(()) => rprintln!("Compass calibrated; saved to the IMU"),
+                                Ok(()) => {
+                                    calibration_saved = true;
+                                    rprintln!("Compass calibrated; the IMU confirmed saving it");
+                                }
                                 Err(error) => {
-                                    rprintln!("Saving the compass calibration failed: {:?}", error)
+                                    next_save = Instant::now() + RETRY_DELAY;
+                                    rprintln!(
+                                        "Saving the compass calibration failed: {:?}; retrying",
+                                        error
+                                    );
                                 }
                             }
                         }
@@ -349,7 +361,8 @@ mod imu {
                         );
                         let roll_deg = quaternion.to_euler().roll_deg;
                         let (accuracy, hint) = match event.accuracy {
-                            Accuracy::High => ("high", ""),
+                            Accuracy::High if calibration_saved => ("high", " saved"),
+                            Accuracy::High => ("high", " saving"),
                             Accuracy::Medium => ("med", " fig8"),
                             Accuracy::Low => ("low", " fig8"),
                             Accuracy::Unreliable => ("bad", " fig8"),
