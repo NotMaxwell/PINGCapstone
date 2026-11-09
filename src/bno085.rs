@@ -78,6 +78,7 @@ const EXECUTABLE_RESET: u8 = 0x01;
 const COMMAND_TARE: u8 = 0x03;
 const COMMAND_SAVE_DCD: u8 = 0x06;
 const COMMAND_ME_CALIBRATE: u8 = 0x07;
+const COMMAND_CLEAR_DCD_AND_RESET: u8 = 0x0B;
 
 const TARE_NOW: u8 = 0x00;
 const TARE_PERSIST: u8 = 0x01;
@@ -294,6 +295,11 @@ where
     pub async fn soft_reset(&mut self) -> Result<(), Error<T::Error>> {
         self.write_cargo(Channel::Executable, &[EXECUTABLE_RESET])
             .await?;
+        self.await_reset().await
+    }
+
+    /// Waits for the hub to come back up after being told to reset.
+    async fn await_reset(&mut self) -> Result<(), Error<T::Error>> {
         self.delay.delay_ms(BOOT_DELAY_MS).await;
 
         // A reset resets the hub's sequence numbers too.
@@ -465,12 +471,22 @@ where
         Ok(())
     }
 
-    /// Saves the running calibration to flash.
+    /// Forgets the calibration the hub has learnt and resets it.
     ///
-    /// Worth doing once the hub reports [`Accuracy::High`], so the next boot
-    /// starts from a good calibration instead of relearning it. Waits for the
-    /// hub to confirm the write, and fails with [`Error::Rejected`] if it
-    /// did not happen.
+    /// CEVA documents this as clearing the copy in RAM, so what is in flash
+    /// is only replaced by the next [`Bno085::save_calibration`]. Reports
+    /// stop, as after any reset.
+    pub async fn clear_calibration(&mut self) -> Result<(), Error<T::Error>> {
+        self.send_command(COMMAND_CLEAR_DCD_AND_RESET, &[0; 9])
+            .await?;
+        self.await_reset().await
+    }
+
+    /// Saves the running calibration to flash, so the next boot starts from
+    /// it instead of relearning it.
+    ///
+    /// Waits for the hub to confirm the write, and fails with
+    /// [`Error::Rejected`] if it did not happen.
     ///
     /// Any reports left from the last [`Bno085::read_event`] packet are
     /// dropped, because the reply is read into the same buffer.
