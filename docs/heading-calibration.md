@@ -119,6 +119,20 @@ face that was tilted shows up here as a scale error.
 Headings measured without a calibration are worth nothing; `heading_cal`
 records them anyway but marks the result provisional.
 
+#### Calibrating again from ordinary handling
+
+The application also works out the hard iron offset by itself after every
+power up, from the turning and tilting it gets as you carry it. It needs about
+two minutes with the device tilting around ±30°, or under a minute with bigger
+movements. Walking around with it held level is not enough, because that only
+turns it about one axis. Until it succeeds, the application uses
+`MAG_CALIBRATION`, and the RTT log says `Compass calibrated from handling` when
+it does.
+
+This does not replace `imu_cal`. Only the full sequence can measure soft iron,
+and the offset it learns is forgotten at the next power up. `heading_cal` uses
+`MAG_CALIBRATION` alone, so measure the heading correction after `imu_cal`.
+
 ### 3. Check the field with `compass_diag`
 
 Run `compass_diag` where the measurement will happen and compare its field
