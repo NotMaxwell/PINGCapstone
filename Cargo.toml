@@ -36,6 +36,12 @@ path = "./src/bin/imu_demo.rs"
 name = "compass_diag"
 path = "./src/bin/compass_diag.rs"
 
+# Wipes the BNO085's calibration, walks through a six face sequence and fits
+# the magnetometer's hard and soft iron correction.
+[[bin]]
+name = "imu_cal"
+path = "./src/bin/imu_cal.rs"
+
 # Measures the heading correction against known bearings, and says whether a
 # single correction is the right fix.
 [[bin]]

@@ -88,6 +88,7 @@ use embassy_time::Duration;
 
 use crate::bno085::Vec3;
 use crate::geo::Position;
+use crate::mag_cal::MagCalibration;
 
 /// Takes the GPIO wired to a named signal out of esp-hal's `Peripherals`.
 ///
@@ -221,6 +222,9 @@ pub const GPS_RATE_HZ: u8 = 10;
 /// How often the IMU reports its orientation: every 10 ms, i.e. 100 Hz.
 pub const IMU_REPORT_INTERVAL_US: u32 = 10_000;
 
+/// How often the IMU reports the magnetic field: every 20 ms, i.e. 50 Hz.
+pub const MAG_REPORT_INTERVAL_US: u32 = 20_000;
+
 // ---------------------------------------------------------------------------
 // Aiming
 // ---------------------------------------------------------------------------
@@ -235,20 +239,35 @@ pub const LIDAR_BORESIGHT: Vec3 = Vec3 {
     z: 0.0,
 };
 
-/// Everything added to the heading the IMU reports, in degrees, positive to
-/// turn the bearing clockwise.
+/// The magnetometer's hard and soft iron correction, as `imu_cal` measures
+/// and prints it. `None` means it has not been calibrated: the device still
+/// reports a heading from the raw field, but marks it unreliable.
 ///
-/// Zero, as it stands, means the bearings the device reports are the IMU's
-/// own, with nothing added. The rotation vector takes its heading from the
-/// magnetometer, so those are bearings from *magnetic* north: around
-/// Huntsville that is some 4° off true north, which moves a target about 7 m
-/// sideways at 100 m of range.
+/// Calibrate again whenever anything magnetic near the IMU is added, moved
+/// or taken away. `docs/heading-calibration.md` is the procedure.
+pub const MAG_CALIBRATION: Option<MagCalibration> = None;
+
+/// Earth's field in Huntsville, Alabama, from the World Magnetic Model
+/// (WMM2025) for late 2026: total strength, µT, which the field `imu_cal`
+/// fits is checked against.
+pub const EXPECTED_FIELD_UT: f32 = 48.8;
+
+/// How far below the horizon that field points there, degrees.
+pub const EXPECTED_DIP_DEG: f32 = 62.6;
+
+/// Everything added to the heading the compass reports, in degrees, positive
+/// to turn the bearing clockwise.
+///
+/// Zero, as it stands, means the bearings the device reports are the
+/// compass's own, with nothing added. Those are bearings from *magnetic*
+/// north: around Huntsville that is some 4° off true north, which moves a
+/// target about 7 m sideways at 100 m of range.
 ///
 /// This is one measured number rather than a magnetic model plus a trim. The
 /// error between what the device reports and a bearing that is known is the
 /// declination where the device is used, the IMU breakout sitting crooked
-/// against the direction the LiDAR looks, and whatever hard iron bias the
-/// hub's calibration leaves behind, all at once; nothing on the device can
+/// against the direction the LiDAR looks, and whatever hard iron bias
+/// [`MAG_CALIBRATION`] leaves behind, all at once; nothing on the device can
 /// tell them apart, and only their sum changes a coordinate. Measuring the
 /// sum against known bearings is also the only form of it that can be checked
 /// against reality.
