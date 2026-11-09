@@ -28,6 +28,7 @@
 use libm::{atan2f, cbrt, cosf, sinf, sqrt, sqrtf};
 
 use crate::bno085::{Accuracy, Quaternion, Vec3};
+use crate::constants::EXPECTED_FIELD_UT;
 
 /// How many readings [`Collector`] keeps.
 pub const CAPACITY: usize = 512;
@@ -64,6 +65,24 @@ pub const MAX_RESIDUAL: f32 = 0.03;
 
 /// How far the fitted field strength may sit from Earth's, as a fraction.
 pub const FIELD_TOLERANCE: f32 = 0.2;
+
+/// The fewest kept readings [`StartupCalibration`] will fit.
+const MIN_STARTUP_SAMPLES: usize = 60;
+
+/// How widely readings must spread along their narrowest direction for
+/// [`StartupCalibration`] to trust a fit, µT. In simulated handling this
+/// takes about two minutes of ordinary use with ±30° of tilt, or 40 seconds
+/// with ±50°, and the offset then comes out within about 1 µT.
+const MIN_STARTUP_SPREAD_UT: f32 = 7.0;
+
+/// The largest residual [`StartupCalibration`] accepts. Tighter than
+/// [`MAX_RESIDUAL`] because this fit cannot correct soft iron: one that
+/// leaves soft iron uncorrected can pass the looser limit and still be
+/// several degrees out. Clean fits come in around a third of this.
+const MAX_STARTUP_RESIDUAL: f32 = 0.015;
+
+/// How many newly kept readings to wait for between attempts at a fit.
+const STARTUP_RETRY_READINGS: usize = 10;
 
 /// How many field readings the heading is averaged over, at
 /// [`MAG_REPORT_INTERVAL_US`](crate::constants::MAG_REPORT_INTERVAL_US): about
@@ -240,10 +259,10 @@ impl Default for Collector {
 
 /// Solves `a x = b` by Gaussian elimination with partial pivoting. `None` if
 /// `a` is singular.
-fn solve(mut a: [[f64; 9]; 9], mut b: [f64; 9]) -> Option<[f64; 9]> {
-    for column in 0..9 {
+fn solve<const N: usize>(mut a: [[f64; N]; N], mut b: [f64; N]) -> Option<[f64; N]> {
+    for column in 0..N {
         let mut pivot = column;
-        for row in column + 1..9 {
+        for row in column + 1..N {
             if a[row][column].abs() > a[pivot][column].abs() {
                 pivot = row;
             }
@@ -254,7 +273,7 @@ fn solve(mut a: [[f64; 9]; 9], mut b: [f64; 9]) -> Option<[f64; 9]> {
         a.swap(column, pivot);
         b.swap(column, pivot);
 
-        for row in column + 1..9 {
+        for row in column + 1..N {
             let factor = a[row][column] / a[column][column];
             let pivot_row = a[column];
             for (target, value) in a[row].iter_mut().zip(pivot_row).skip(column) {
@@ -264,10 +283,10 @@ fn solve(mut a: [[f64; 9]; 9], mut b: [f64; 9]) -> Option<[f64; 9]> {
         }
     }
 
-    let mut x = [0.0; 9];
-    for row in (0..9).rev() {
+    let mut x = [0.0; N];
+    for row in (0..N).rev() {
         let mut sum = b[row];
-        for k in row + 1..9 {
+        for k in row + 1..N {
             sum -= a[row][k] * x[k];
         }
         x[row] = sum / a[row][row];
@@ -456,6 +475,187 @@ pub fn fit(samples: &[Vec3]) -> Result<MagCalibration, FitError> {
     })
 }
 
+/// A hard iron fit, and how far it can be trusted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HardIronFit {
+    pub calibration: MagCalibration,
+    /// How widely the readings spread along their narrowest direction, µT:
+    /// the standard deviation there. A device only ever turned about one
+    /// axis leaves this near zero.
+    pub spread_ut: f32,
+}
+
+/// Fits only the hard iron offset, keeping `matrix`: `magcal`'s `eye` fit,
+/// with a known soft iron correction applied first.
+///
+/// Four unknowns need far less coverage than the nine of [`fit`], which is
+/// what makes it possible from ordinary handling. The sphere `|y - c|² = β²`
+/// is linear in `c` and `β² - |c|²`.
+pub fn fit_hard_iron(samples: &[Vec3], matrix: [[f32; 3]; 3]) -> Result<HardIronFit, FitError> {
+    if samples.len() < MIN_FIT_SAMPLES {
+        return Err(FitError::TooFewSamples);
+    }
+    let a = matrix.map(|r| r.map(f64::from));
+    let transformed = |s: &Vec3| {
+        let x = [f64::from(s.x), f64::from(s.y), f64::from(s.z)];
+        [
+            a[0][0] * x[0] + a[0][1] * x[1] + a[0][2] * x[2],
+            a[1][0] * x[0] + a[1][1] * x[1] + a[1][2] * x[2],
+            a[2][0] * x[0] + a[2][1] * x[1] + a[2][2] * x[2],
+        ]
+    };
+
+    let count = samples.len() as f64;
+    let mut mean = [0.0f64; 3];
+    for s in samples {
+        let y = transformed(s);
+        for axis in 0..3 {
+            mean[axis] += y[axis] / count;
+        }
+    }
+    let mut covariance = [[0.0f64; 3]; 3];
+    let mut ata = [[0.0f64; 4]; 4];
+    let mut atb = [0.0f64; 4];
+    const SCALE: f64 = 50.0;
+    for s in samples {
+        let y = transformed(s);
+        let d = [y[0] - mean[0], y[1] - mean[1], y[2] - mean[2]];
+        for i in 0..3 {
+            for j in 0..3 {
+                covariance[i][j] += d[i] * d[j] / count;
+            }
+        }
+        let u = d.map(|c| c / SCALE);
+        let row = [2.0 * u[0], 2.0 * u[1], 2.0 * u[2], 1.0];
+        let target = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
+        for i in 0..4 {
+            for j in 0..4 {
+                ata[i][j] += row[i] * row[j];
+            }
+            atb[i] += row[i] * target;
+        }
+    }
+    let solution = solve(ata, atb).ok_or(FitError::Singular)?;
+    let c = [solution[0], solution[1], solution[2]];
+    let squared = solution[3] + c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
+    if squared <= 0.0 {
+        return Err(FitError::NotAnEllipsoid);
+    }
+    let beta = sqrt(squared) * SCALE;
+    let centre = [
+        c[0] * SCALE + mean[0],
+        c[1] * SCALE + mean[1],
+        c[2] * SCALE + mean[2],
+    ];
+
+    // b = A⁻¹ c, by cofactors.
+    let m = a;
+    let cof = [
+        [
+            m[1][1] * m[2][2] - m[1][2] * m[2][1],
+            m[0][2] * m[2][1] - m[0][1] * m[2][2],
+            m[0][1] * m[1][2] - m[0][2] * m[1][1],
+        ],
+        [
+            m[1][2] * m[2][0] - m[1][0] * m[2][2],
+            m[0][0] * m[2][2] - m[0][2] * m[2][0],
+            m[0][2] * m[1][0] - m[0][0] * m[1][2],
+        ],
+        [
+            m[1][0] * m[2][1] - m[1][1] * m[2][0],
+            m[0][1] * m[2][0] - m[0][0] * m[2][1],
+            m[0][0] * m[1][1] - m[0][1] * m[1][0],
+        ],
+    ];
+    let det = m[0][0] * cof[0][0] + m[0][1] * cof[1][0] + m[0][2] * cof[2][0];
+    if det == 0.0 {
+        return Err(FitError::Singular);
+    }
+    let offset = [
+        (cof[0][0] * centre[0] + cof[0][1] * centre[1] + cof[0][2] * centre[2]) / det,
+        (cof[1][0] * centre[0] + cof[1][1] * centre[1] + cof[1][2] * centre[2]) / det,
+        (cof[2][0] * centre[0] + cof[2][1] * centre[1] + cof[2][2] * centre[2]) / det,
+    ];
+
+    let mut sum = 0.0;
+    for s in samples {
+        let y = transformed(s);
+        let d = [y[0] - centre[0], y[1] - centre[1], y[2] - centre[2]];
+        let excess = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] - beta * beta;
+        sum += excess * excess;
+    }
+    let (eigenvalues, _) = symmetric_eigen(covariance);
+    let narrowest = eigenvalues[0]
+        .min(eigenvalues[1])
+        .min(eigenvalues[2])
+        .max(0.0);
+
+    Ok(HardIronFit {
+        calibration: MagCalibration {
+            offset: offset.map(|v| v as f32),
+            matrix,
+            field_ut: beta as f32,
+            residual: (sqrt(sum / count) / (2.0 * beta * beta)) as f32,
+        },
+        spread_ut: sqrt(narrowest) as f32,
+    })
+}
+
+/// Works out the hard iron offset from ordinary handling after power up.
+///
+/// A full [`fit`] needs readings from every direction, which only a
+/// deliberate sequence gives. What changes from one session to the next is
+/// the hard iron, though, and four unknowns can be found from the turning
+/// and tilting a device gets as it is carried about. Soft iron stays as
+/// `imu_cal` measured it, or uncorrected if it never has.
+pub struct StartupCalibration {
+    readings: Collector,
+    matrix: [[f32; 3]; 3],
+    next_attempt: usize,
+    done: bool,
+}
+
+impl StartupCalibration {
+    /// Starts collecting. `matrix` is the soft iron correction to keep;
+    /// `None` leaves the field as the hub reports it.
+    pub const fn new(matrix: Option<[[f32; 3]; 3]>) -> Self {
+        Self {
+            readings: Collector::new(),
+            matrix: match matrix {
+                Some(matrix) => matrix,
+                None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            },
+            next_attempt: MIN_STARTUP_SAMPLES,
+            done: false,
+        }
+    }
+
+    /// Takes an uncalibrated field reading. Returns a calibration the one
+    /// time it has one it trusts; nothing after that.
+    pub fn add(&mut self, raw: Vec3) -> Option<MagCalibration> {
+        if self.done || !self.readings.add(raw) {
+            return None;
+        }
+        let samples = self.readings.samples();
+        if samples.len() < self.next_attempt {
+            return None;
+        }
+        self.next_attempt = samples.len() + STARTUP_RETRY_READINGS;
+
+        let found = fit_hard_iron(samples, self.matrix).ok()?;
+        let calibration = found.calibration;
+        let trusted = found.spread_ut >= MIN_STARTUP_SPREAD_UT
+            && calibration.residual <= MAX_STARTUP_RESIDUAL
+            && (calibration.field_ut - EXPECTED_FIELD_UT).abs()
+                <= FIELD_TOLERANCE * EXPECTED_FIELD_UT;
+        if !trusted {
+            return None;
+        }
+        self.done = true;
+        Some(calibration)
+    }
+}
+
 /// A heading from [`Compass`].
 #[derive(Clone, Copy, Debug)]
 pub struct Heading {
@@ -516,6 +716,15 @@ impl Compass {
             samples: 0,
             deviation: 0.0,
         }
+    }
+
+    /// Switches to a new calibration. Where north lies has to be worked out
+    /// afresh, because the old estimate was made with the old correction.
+    pub fn set_calibration(&mut self, calibration: MagCalibration) {
+        self.calibration = Some(calibration);
+        self.east = 0.0;
+        self.north = 0.0;
+        self.samples = 0;
     }
 
     /// Takes a game rotation vector report.

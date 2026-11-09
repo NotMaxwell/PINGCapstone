@@ -482,7 +482,7 @@ mod sensors {
         COMPASS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE,
         MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
-    use ping_capstone::mag_cal::Compass;
+    use ping_capstone::mag_cal::{Compass, StartupCalibration};
     use ping_capstone::neo_m9n::NeoM9n;
     use ping_capstone::tf03::Tf03;
     use rtt_target::rprintln;
@@ -551,6 +551,7 @@ mod sensors {
 
             // The game rotation vector's frame starts over with the hub.
             let mut compass = Compass::new(MAG_CALIBRATION);
+            let mut startup = StartupCalibration::new(MAG_CALIBRATION.map(|c| c.matrix));
             let mut next_log = Instant::now();
             'reporting: loop {
                 match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {
@@ -570,6 +571,17 @@ mod sensors {
                         Ok(Some(event)) => match event.data {
                             SensorData::MagneticFieldUncalibrated { field, .. } => {
                                 compass.update_field(field);
+                                if let Some(found) = startup.add(field) {
+                                    rprintln!(
+                                        "Compass calibrated from handling: hard iron {:.1} {:.1} {:.1} uT, field {:.1} uT, residual {:.4}",
+                                        found.offset[0],
+                                        found.offset[1],
+                                        found.offset[2],
+                                        found.field_ut,
+                                        found.residual
+                                    );
+                                    compass.set_calibration(found);
+                                }
                             }
                             SensorData::GameRotationVector(quaternion) => {
                                 compass.update_game(quaternion);
@@ -632,7 +644,7 @@ mod sensors {
             if orientation.calibration == Accuracy::High {
                 ""
             } else {
-                " (run imu_cal if never calibrated, otherwise the field is disturbed)"
+                " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)"
             }
         );
     }
@@ -775,7 +787,7 @@ mod display {
                         ),
                         Accuracy::Medium => String::from("cal med"),
                         Accuracy::Low => String::from("cal low"),
-                        Accuracy::Unreliable => String::from("cal bad"),
+                        Accuracy::Unreliable => String::from("cal bad - move"),
                     },
                 )
             }
