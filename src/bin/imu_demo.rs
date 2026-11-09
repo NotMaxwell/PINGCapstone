@@ -9,9 +9,9 @@
 //!
 //! The heading and elevation are worked out exactly as `main.rs` does, from
 //! [`LIDAR_BORESIGHT`] and [`HEADING_CORRECTION_DEG`], so the demo shows the
-//! bearing a button press would use. While that correction is zero the
-//! heading is the IMU's own, from magnetic north; `heading_cal` measures the
-//! correction and `docs/heading-calibration.md` is the procedure. Roll is
+//! bearing a button press would use. The correction starts as Huntsville's
+//! magnetic declination, so the heading is from true north; `heading_cal`
+//! measures it properly and `docs/heading-calibration.md` is the procedure. Roll is
 //! that of the breakout itself, with its printed +Y axis as forward; see
 //! [`Quaternion::to_euler`].
 //!

@@ -258,12 +258,14 @@ pub const EXPECTED_DIP_DEG: f32 = 62.6;
 /// Everything added to the heading the compass reports, in degrees, positive
 /// to turn the bearing clockwise.
 ///
-/// Zero, as it stands, means the bearings the device reports are the
-/// compass's own, with nothing added. Those are bearings from *magnetic*
-/// north: around Huntsville that is some 4° off true north, which moves a
-/// target about 7 m sideways at 100 m of range.
+/// It starts as the magnetic declination in Huntsville, Alabama: 4.3° west,
+/// from the World Magnetic Model (WMM2025) for late 2026. The compass gives
+/// bearings from *magnetic* north, which read 4.3° high there, and left
+/// uncorrected would move a target about 7 m sideways at 100 m of range.
+/// It is only right near Huntsville.
 ///
-/// This is one measured number rather than a magnetic model plus a trim. The
+/// `heading_cal` replaces this value rather than adding to it. It is one
+/// number rather than a magnetic model plus a trim. The
 /// error between what the device reports and a bearing that is known is the
 /// declination where the device is used, the IMU breakout sitting crooked
 /// against the direction the LiDAR looks, and whatever hard iron bias
@@ -275,7 +277,7 @@ pub const EXPECTED_DIP_DEG: f32 = 62.6;
 /// The `heading_cal` binary measures it and prints the value to put here.
 /// `docs/heading-calibration.md` is the procedure, and what to do when the
 /// error turns out not to be a constant.
-pub const HEADING_CORRECTION_DEG: f32 = 0.0;
+pub const HEADING_CORRECTION_DEG: f32 = -4.3;
 
 /// Where the device is taken to be while the GPS has no fix, so it can be
 /// tried out before the GPS has an antenna. A live fix is always used when

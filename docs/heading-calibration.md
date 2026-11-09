@@ -21,14 +21,14 @@ So the firmware keeps their sum, as one measured number:
 
 ```rust
 // src/constants.rs
-pub const HEADING_CORRECTION_DEG: f32 = 0.0;
+pub const HEADING_CORRECTION_DEG: f32 = -4.3;
 ```
 
-It is added to every bearing the device reports, positive clockwise. While it
-is zero the device reports the compass's own magnetic bearings, which is where
-it starts: nothing in the firmware guesses the correction from a magnetic model.
-The `heading_cal` binary measures it against bearings that are known, and
-prints the value to put here.
+It is added to every bearing the device reports, positive clockwise. It starts
+as Huntsville's magnetic declination, so bearings are true there but carry any
+mounting error and do not hold in another city. The `heading_cal` binary
+measures the whole correction against bearings that are known, and prints the
+value to replace it with.
 
 Two numbers the measurement can be sanity-checked against, both for
 Huntsville, Alabama, from the World Magnetic Model (WMM2025) for late 2026:
@@ -203,13 +203,13 @@ The routine offers a station again, rather than spoiling the average, when:
 ```
 ---- heading calibration, 4 stations
 station  known  reported  error   elev   roll  steady  compass  hub +/-
-   1      12.4     16.6    +4.2   -0.3   +0.8    0.4   high     5.0
-   2     103.9    108.0    +4.1   -0.5   +1.1    0.5   high     5.0
-   3     198.0    202.4    +4.4   -0.2   +0.9    0.3   high     5.0
-   4     291.5    295.5    +4.0   -0.4   +1.0    0.6   high     5.0
-average error +4.2 deg, spread 0.4 deg peak to peak (limit 5.0)
+   1      12.4     12.3    -0.1   -0.3   +0.8    0.4   high     5.0
+   2     103.9    103.7    -0.2   -0.5   +1.1    0.5   high     5.0
+   3     198.0    198.1    +0.1   -0.2   +0.9    0.3   high     5.0
+   4     291.5    291.2    -0.3   -0.4   +1.0    0.6   high     5.0
+average error -0.1 deg, spread 0.4 deg peak to peak (limit 5.0)
 The error is the same whichever way the device faces, so one number removes it:
-    pub const HEADING_CORRECTION_DEG: f32 = -4.2;   // was 0.0
+    pub const HEADING_CORRECTION_DEG: f32 = -4.2;   // was -4.3
 ```
 
 | Column    | What it is                                                   |
@@ -230,9 +230,9 @@ A result worth acting on has:
 - [ ] **compass** `high` at every station.
 - [ ] **steady** under a degree, and `elev`/`roll` within a few degrees of
   zero.
-- [ ] an average error in the neighbourhood of **+4.3°** — the declination
-  here. Much more than that is mounting or iron on top of the declination;
-  see the troubleshooting table.
+- [ ] an average error near **0°**, because the firmware already applies the
+  4.3° declination. Much more than that is mounting or iron; see the
+  troubleshooting table.
 
 ## Applying it, and checking
 

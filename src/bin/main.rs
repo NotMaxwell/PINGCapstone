@@ -24,9 +24,9 @@
 //!
 //! The bearings come from the compass in [`ping_capstone::mag_cal`], which
 //! needs `imu_cal` to have measured `MAG_CALIBRATION`. They are measured
-//! from magnetic north until [`HEADING_CORRECTION_DEG`] has been measured and set: nothing here
-//! guesses at that correction from a magnetic model. The `heading_cal` binary
-//! measures it against bearings that are known, and
+//! from true north using [`HEADING_CORRECTION_DEG`], which starts as the
+//! magnetic declination in Huntsville. The `heading_cal` binary measures it
+//! against bearings that are known, which also takes in mounting error, and
 //! `docs/heading-calibration.md` is the procedure. [`LIDAR_BORESIGHT`] says
 //! how the LiDAR is mounted against the IMU. Both live in
 //! [`ping_capstone::constants`], with the pin map and every other fixed
