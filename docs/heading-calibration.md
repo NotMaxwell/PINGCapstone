@@ -10,11 +10,11 @@ one number.
 
 ## Background
 
-The IMU's rotation vector takes its heading from the magnetometer, so the
-bearings it reports are measured from **magnetic** north, and they carry two
-other errors with them: the breakout sitting a little crooked against the
+The compass takes its heading from the magnetometer, so the bearings it
+reports are measured from **magnetic** north, and they carry two other errors
+with them: the breakout sitting a little crooked against the
 direction the LiDAR actually looks, and whatever magnetised iron rides along
-with the device. Three causes, one effect — the device cannot tell them apart,
+with the device that the magnetometer calibration has not removed. Three causes, one effect — the device cannot tell them apart,
 and only their sum changes a coordinate.
 
 So the firmware keeps their sum, as one measured number:
@@ -25,8 +25,8 @@ pub const HEADING_CORRECTION_DEG: f32 = 0.0;
 ```
 
 It is added to every bearing the device reports, positive clockwise. While it
-is zero the device reports the IMU's own magnetic bearings, which is where it
-starts: nothing in the firmware guesses the correction from a magnetic model.
+is zero the device reports the compass's own magnetic bearings, which is where
+it starts: nothing in the firmware guesses the correction from a magnetic model.
 The `heading_cal` binary measures it against bearings that are known, and
 prints the value to put here.
 
@@ -61,6 +61,7 @@ measured here does not travel to another city.
 Wherever a step says to run a binary, use:
 
 ```sh
+cargo run --release --bin imu_cal
 cargo run --release --bin heading_cal
 cargo run --release --bin compass_diag
 ```
@@ -85,17 +86,38 @@ device.
 
 ### 2. Calibrate the magnetometer
 
-With the device running `heading_cal` or `imu_demo`, move it in a slow figure
-of eight, turning it over as you go, until the hub reports its compass
-accuracy as `high`.
+Run `imu_cal` away from desks, laptops, vehicles and building steel. It wipes
+what the hub has learnt, then walks through the six faces of the device and
+needs nothing but the display:
 
-- [ ] The display reads `high`, and `heading_cal` prompts `press button`
-  instead of `fig 8 first`.
+1. **Rest it with the named face up** (`+X up`, `-X up`, `+Y up`, `-Y up`,
+   `+Z up`, `-Z up`, using the axes printed on the breakout). It starts on its
+   own once the face is within 10° of straight up and still for a second and
+   a half. Propping it against a box works better than holding it.
+2. **Figure of eight for five seconds**, when the display counts down.
+3. After the sixth face, **tumble it slowly through every direction** until
+   `cover` reaches 24 of 26.
 
-The hub then saves that calibration to its own flash, so later boots — and the
-application — start from it. Headings measured on an uncalibrated magnetometer
-are worth nothing; the routine records them anyway but marks the result
-provisional.
+Then it fits an ellipsoid to the readings and prints the result over RTT. It
+is good if:
+
+- [ ] `sectors covered` is at least 24 of 26. Readings from one side alone can
+  fit with a tiny residual and still be wrong.
+- [ ] `residual` is under 0.03. Around 0.01 is normal.
+- [ ] `field strength` is within 20% of **48.8 µT**.
+
+Paste the printed `MAG_CALIBRATION` over the one in
+[`src/constants.rs`](../src/constants.rs). A failed run prints why and no
+constant; move away from whatever is near and press reset to go again.
+
+The magnetometer correction lives in the firmware, because the hub has no way
+to accept one. The hub saves only its own accelerometer and gyroscope
+calibration. The `accelerometer, six point check` lines are a check of that:
+bias near 0 and scale near 1. Each axis reads gravity up and then down, and a
+face that was tilted shows up here as a scale error.
+
+Headings measured without a calibration are worth nothing; `heading_cal`
+records them anyway but marks the result provisional.
 
 ### 3. Check the field with `compass_diag`
 
@@ -104,9 +126,9 @@ against the table above.
 
 - [ ] Strength within a few µT of **48.8**.
 - [ ] Dip within a few degrees of **62.6**.
-- [ ] The fused, geomagnetic and raw headings on its lines agree within a
-  degree or two of each other.
-- [ ] The hard iron correction is small and stops growing.
+- [ ] The `compass (app)` heading and the `-> heading` on the field line agree
+  within a degree or two.
+- [ ] The compass status reads `High`.
 
 **Fail:** something near the magnetometer is bending the field. Stop here and
 work through *When the error is not a constant* below — a correction measured
@@ -144,7 +166,8 @@ one that changes with the heading.
 ## Measuring the correction
 
 1. Flash and start the routine: `cargo run --release --bin heading_cal`.
-2. Figure of eight until the display reads `high`.
+2. Check the display reads `high`. If it reads `compass poor`, run `imu_cal`
+   first, or move away from whatever is disturbing the field.
 3. Set the device down level on its mount at the measuring spot, and aim it
    along the first station's bearing: the LiDAR's own line of sight, at that
    station's landmark.
@@ -183,8 +206,8 @@ The error is the same whichever way the device faces, so one number removes it:
 | `elev`    | Elevation of the boresight; near zero means level            |
 | `roll`    | Roll of the breakout; near zero means level                  |
 | `steady`  | How far the heading wandered while averaging                 |
-| `compass` | The worst the hub thought of its compass during the station  |
-| `hub +/-` | The hub's own estimate of its heading error                  |
+| `compass` | The worst the compass thought of itself during the station   |
+| `hub +/-` | The compass's estimate of its heading error, from the fit's residual and how far the field strength is off |
 
 A result worth acting on has:
 
@@ -249,15 +272,16 @@ again.
 
 | Symptom | Likely cause | What to do |
 |---------|--------------|------------|
-| Compass accuracy never reaches `high` | Not enough motion, or a bent field | Slow figure of eight, rolling the device through all orientations, away from desks and laptops. If it still refuses, run `compass_diag`: a field far off 48.8 µT is the real problem |
+| Compass accuracy never reaches `high` | `MAG_CALIBRATION` is `None` or out of date, or a bent field | Run `imu_cal`. If it already passed, run `compass_diag`: a field far off 48.8 µT is the real problem |
+| `imu_cal` stops at `residual too big` or `wrong field` | Something near the device, or a magnet that moves relative to the IMU | Move away and run it again. A magnet fixed to the device is fine and is what the calibration removes; one that shifts, such as an antenna on a loose cable, cannot be calibrated out |
 | `compass_diag` field strength far off 48.8 µT, or dip far off 62.6° | Magnetised iron or a current near the IMU | *When the error is not a constant*, above |
 | Spread over 5°, average looks plausible | Soft iron or a current turning with the device | *When the error is not a constant*, above |
 | Error close to +90°, −90° or 180° at every station | `LIDAR_BORESIGHT` names the wrong axis | Set it to the axis the LiDAR actually looks along, in the breakout's printed frame, in [`src/constants.rs`](../src/constants.rs). A whole quarter turn is a frame mistake, not something to trim away |
 | Error consistent but tens of degrees, and the boresight is right | The breakout is mounted crooked | The correction will absorb it, but a large one is fragile: it only holds while the IMU never shifts in its mount. Straighten the mounting if you can |
-| Heading drifts slowly while the device sits still | Magnetometer not really calibrated; the fused heading is leaning on the gyro | Compare the three headings in `compass_diag`. The fused and geomagnetic ones should agree; the game heading is gyro-only and drifting is normal for it |
+| Heading drifts slowly while the device sits still | Field being rejected as disturbed, so the heading is coasting on the gyroscope | Compare the headings in `compass_diag`. The compass and field headings should agree; the game heading is gyro-only and drifting is normal for it |
 | Heading jumps a degree or two when the button is pressed | Pressing jogs the device | Use a mount, press gently. The application samples at the moment the button goes down for this reason, so a jog afterwards does not matter |
-| Heading good one run, several degrees off the next | Hub re-calibrating after a reset, or the IMU shifting in its mount | Wait for `high` before measuring. If it repeats, check that nothing in the assembly moves |
-| `hub +/-` large (tens of degrees) | The hub does not trust its own heading | Treat the result as provisional: calibrate, check the field, measure again |
+| Heading good one run, several degrees off the next | The compass settling after a reset (about three seconds), or the IMU shifting in its mount | Wait a few seconds before measuring. If it repeats, check that nothing in the assembly moves |
+| `hub +/-` large (tens of degrees) | The compass does not trust its heading | Treat the result as provisional: calibrate, check the field, measure again |
 | Elevation has the wrong sign, or roll looks swapped | The breakout is mounted in a different orientation than the boresight assumes | Check the printed axes against [`src/bno085/reports.rs`](../src/bno085/reports.rs)'s description of yaw, pitch and roll, then fix `LIDAR_BORESIGHT` |
 | Correction good outdoors, wrong indoors (or vice versa) | Building steel | Calibrate where the device is used, and expect indoor bearings to be poor |
 | Coordinates off by a consistent sideways distance, bearings look right | The correction was never applied | Check `HEADING_CORRECTION_DEG` in the flashed build, and that the application was reflashed after it changed |
@@ -272,20 +296,26 @@ One measured number, checked against the local declination for plausibility,
 is harder to get wrong.
 
 **Why not the hub's tare.** The BNO085 can rotate its own reference frame and
-persist that in its flash ([`Bno085::tare`](../src/bno085.rs)). It would work,
-but it hides the correction inside a part, where it survives reflashing,
+persist that in its flash ([`Bno085::tare`](../src/bno085.rs)). It would apply
+only to the hub's own outputs, and it hides the correction inside a part,
+where it survives reflashing,
 cannot be read back or reviewed, and quietly disappears when a hub is
 replaced. The number stays in `constants.rs`, where it is visible in the
 source tree.
 
 ## References
 
+- [`src/bin/imu_cal.rs`](../src/bin/imu_cal.rs): the six face sequence.
+- [`src/mag_cal.rs`](../src/mag_cal.rs): the ellipsoid fit and the compass.
+- MathWorks, [Magnetometer
+  calibration](https://www.mathworks.com/help/fusion/ug/magnetometer-calibration.html):
+  the model, the `sym` fit and the residual used here.
 - [`src/bin/heading_cal.rs`](../src/bin/heading_cal.rs): the routine, its
   stations and its limits.
 - [`src/bin/compass_diag.rs`](../src/bin/compass_diag.rs): the field and
   heading diagnostic, and the expected field for Huntsville.
-- [`src/constants.rs`](../src/constants.rs): `HEADING_CORRECTION_DEG` and
-  `LIDAR_BORESIGHT`.
+- [`src/constants.rs`](../src/constants.rs): `MAG_CALIBRATION`,
+  `HEADING_CORRECTION_DEG` and `LIDAR_BORESIGHT`.
 - [`src/geo.rs`](../src/geo.rs): how a bearing and a range become a
   coordinate, and how heading error propagates into it.
 - NOAA, [magnetic field
