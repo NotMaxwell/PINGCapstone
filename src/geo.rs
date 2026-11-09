@@ -56,7 +56,7 @@ pub struct Aim {
 impl Aim {
     /// The direction `boresight` points, given the IMU's orientation.
     ///
-    /// `orientation` is the BNO085's rotation vector. The BNO085 uses
+    /// `orientation` is the compass's, in the BNO085's frames. The BNO085 uses
     /// Android's frames of reference, so the quaternion turns a vector in the
     /// sensor's own frame (the axes printed on the breakout) into a world
     /// frame whose X axis points east, Y to magnetic north and Z up.

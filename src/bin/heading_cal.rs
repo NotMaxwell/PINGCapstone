@@ -1,9 +1,8 @@
 //! Measures the heading correction: how far the bearing the device reports
 //! sits from the bearing it is actually pointing along.
 //!
-//! The IMU's rotation vector takes its heading from the magnetometer, so the
-//! bearings it gives are measured from magnetic north, and they also carry
-//! however crookedly the breakout is mounted against the LiDAR and whatever
+//! The compass takes its heading from the magnetometer, so the bearings it
+//! gives are measured from magnetic north, and they also carry however crookedly the breakout is mounted against the LiDAR and whatever
 //! magnetised iron rides along with it. Those are three different causes with
 //! one effect, and the device cannot tell them apart. This measures their sum
 //! against bearings that are known, which is the only form of it that can be
@@ -216,9 +215,10 @@ mod cal {
     use ping_capstone::bno085::{Accuracy, Bno085, SensorData, SensorId, SpiTransport};
     use ping_capstone::constants::{
         DEBOUNCE, HEADING_CORRECTION_DEG, IMU_REPORT_INTERVAL_US, LCD_REFRESH, LIDAR_BORESIGHT,
-        RETRY_DELAY,
+        MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::geo::Aim;
+    use ping_capstone::mag_cal::Compass;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
 
@@ -255,7 +255,7 @@ mod cal {
         deg
     }
 
-    /// Ranks what the hub thinks of its compass, so two reports' opinions can
+    /// Ranks what the compass makes of itself, so two reports' opinions can
     /// be compared. [`Accuracy`] has no ordering of its own.
     fn rank(accuracy: Accuracy) -> u8 {
         match accuracy {
@@ -266,14 +266,14 @@ mod cal {
         }
     }
 
-    /// What the operator should do next, given what the hub makes of its
-    /// compass: a heading measured on an uncalibrated magnetometer is not
-    /// worth recording.
+    /// What the operator should do next, given what the compass makes of
+    /// itself: a heading measured on an uncalibrated magnetometer or in a
+    /// disturbed field is not worth recording.
     fn prompt(accuracy: Accuracy) -> &'static str {
         if accuracy == Accuracy::High {
             "press button"
         } else {
-            "fig 8 first"
+            "compass poor"
         }
     }
 
@@ -329,9 +329,9 @@ mod cal {
         steady_deg: f32,
         elevation_deg: f32,
         roll_deg: f32,
-        /// The worst the hub thought of its compass over the window.
+        /// The worst the compass thought of itself over the window.
         calibration: Accuracy,
-        /// The hub's own estimate of its heading error, averaged.
+        /// The compass's own estimate of its heading error, averaged.
         accuracy_deg: f32,
     }
 
@@ -396,21 +396,24 @@ mod cal {
         true
     }
 
-    /// Everything the hub has waiting, decoded, with the last rotation vector
-    /// of the lot handed back. Reading when nothing is pending is harmless,
-    /// so this needs no interrupt and can be dropped into any wait.
-    async fn drain(imu: &mut Imu, saved: &mut bool) -> Option<Reading> {
+    /// Everything the hub has waiting, decoded, with the last heading of the
+    /// lot handed back. Reading when nothing is pending is harmless, so this
+    /// needs no interrupt and can be dropped into any wait.
+    async fn drain(imu: &mut Imu, compass: &mut Compass) -> Option<Reading> {
         let mut latest = None;
         loop {
             match imu.read_event().await {
-                Ok(Some(event)) => {
-                    if let SensorData::RotationVector {
-                        quaternion,
-                        accuracy_rad,
-                    } = event.data
-                    {
+                Ok(Some(event)) => match event.data {
+                    SensorData::MagneticFieldUncalibrated { field, .. } => {
+                        compass.update_field(field);
+                    }
+                    SensorData::GameRotationVector(quaternion) => {
+                        compass.update_game(quaternion);
+                        let Some(heading) = compass.heading() else {
+                            continue;
+                        };
                         let aim = Aim::from_orientation(
-                            &quaternion,
+                            &heading.quaternion,
                             LIDAR_BORESIGHT,
                             HEADING_CORRECTION_DEG,
                         );
@@ -418,24 +421,13 @@ mod cal {
                             heading_deg: aim.azimuth_deg,
                             steady_deg: 0.0,
                             elevation_deg: aim.elevation_deg,
-                            roll_deg: quaternion.to_euler().roll_deg,
-                            calibration: event.accuracy,
-                            accuracy_deg: accuracy_rad.to_degrees(),
+                            roll_deg: heading.quaternion.to_euler().roll_deg,
+                            calibration: heading.status,
+                            accuracy_deg: heading.accuracy_rad.to_degrees(),
                         });
-                        // Saved the first time the hub is confident, so the
-                        // next boot — and the application — starts from the
-                        // calibration this run was measured against.
-                        if event.accuracy == Accuracy::High && !*saved {
-                            *saved = true;
-                            match imu.save_calibration().await {
-                                Ok(()) => rprintln!("Compass calibrated; saved to the IMU"),
-                                Err(error) => {
-                                    rprintln!("Saving the compass calibration failed: {:?}", error)
-                                }
-                            }
-                        }
                     }
-                }
+                    _ => {}
+                },
                 // Nothing left waiting.
                 Ok(None) => return latest,
                 Err(error) => {
@@ -452,7 +444,7 @@ mod cal {
         imu: &mut Imu,
         lcd: &mut Display,
         button: &mut Input<'static>,
-        saved: &mut bool,
+        compass: &mut Compass,
         station: usize,
         reference_deg: f32,
     ) {
@@ -477,7 +469,7 @@ mod cal {
                 continue;
             }
 
-            if let Some(reading) = drain(imu, saved).await {
+            if let Some(reading) = drain(imu, compass).await {
                 latest = Some(reading);
             }
             if !due(&mut next_refresh) {
@@ -517,9 +509,9 @@ mod cal {
     }
 
     /// Averages the heading over [`SAMPLE_WINDOW`], along with the elevation,
-    /// the roll and what the hub makes of its own compass. `None` if the hub
-    /// sent no rotation vector in all that time.
-    async fn measure(imu: &mut Imu, saved: &mut bool) -> Option<Reading> {
+    /// the roll and what the compass makes of itself. `None` if there was no
+    /// heading in all that time.
+    async fn measure(imu: &mut Imu, compass: &mut Compass) -> Option<Reading> {
         let deadline = Instant::now() + SAMPLE_WINDOW;
         let mut heading = Angles::default();
         let mut elevation_deg = 0.0;
@@ -529,7 +521,7 @@ mod cal {
         let mut count = 0u32;
 
         while Instant::now() < deadline {
-            let Some(reading) = drain(imu, saved).await else {
+            let Some(reading) = drain(imu, compass).await else {
                 Timer::after(IDLE_POLL).await;
                 continue;
             };
@@ -564,11 +556,11 @@ mod cal {
 
     /// Waits for the button to be let go and to stay up past any contact
     /// bounce, keeping the hub drained while it waits.
-    async fn wait_for_release(imu: &mut Imu, button: &mut Input<'static>, saved: &mut bool) {
+    async fn wait_for_release(imu: &mut Imu, button: &mut Input<'static>, compass: &mut Compass) {
         loop {
             while button.is_low() {
                 let _ = with_timeout(BUTTON_POLL, button.wait_for_high()).await;
-                let _ = drain(imu, saved).await;
+                let _ = drain(imu, compass).await;
             }
             Timer::after(DEBOUNCE).await;
             if button.is_high() {
@@ -663,9 +655,9 @@ mod cal {
         }
         if worst != Accuracy::High {
             rprintln!(
-                "The hub's confidence in its compass fell to {:?} during the run, so this result \
-                 is provisional: move the device in a slow figure of eight until it reads high, \
-                 then measure again.",
+                "The compass's confidence fell to {:?} during the run, so this result is \
+                 provisional: run imu_cal if it has never been calibrated, otherwise move away \
+                 from whatever is disturbing the field, then measure again.",
                 worst
             );
         }
@@ -740,14 +732,18 @@ mod cal {
         }
 
         // The same configuration the application uses, so the headings
-        // measured here are the headings it will report: the hub calibrates
-        // the accelerometer and magnetometer, and the rotation vector is the
-        // fused one.
-        let started = match imu.configure_calibration(true, false, true).await {
-            Ok(()) => {
-                imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
-                    .await
-            }
+        // measured here are the headings it will report.
+        let started = match imu.configure_calibration(true, false, false).await {
+            Ok(()) => match imu
+                .enable_report(SensorId::GameRotationVector, IMU_REPORT_INTERVAL_US)
+                .await
+            {
+                Ok(()) => {
+                    imu.enable_report(SensorId::MagneticFieldUncalibrated, MAG_REPORT_INTERVAL_US)
+                        .await
+                }
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         if let Err(error) = started {
@@ -771,7 +767,7 @@ mod cal {
         );
         rprintln!("Hold the device level, aim it along each bearing in turn and press the button.");
 
-        let mut saved = false;
+        let mut compass = Compass::new(MAG_CALIBRATION);
         loop {
             let mut stations = [None; STATIONS.len()];
             for (index, &reference_deg) in STATIONS.iter().enumerate() {
@@ -783,7 +779,7 @@ mod cal {
                         &mut imu,
                         &mut lcd,
                         &mut button,
-                        &mut saved,
+                        &mut compass,
                         index,
                         reference_deg,
                     )
@@ -797,8 +793,8 @@ mod cal {
                         ],
                     )
                     .await;
-                    let reading = measure(&mut imu, &mut saved).await;
-                    wait_for_release(&mut imu, &mut button, &mut saved).await;
+                    let reading = measure(&mut imu, &mut compass).await;
+                    wait_for_release(&mut imu, &mut button, &mut compass).await;
 
                     let Some(reading) = reading else {
                         show(
@@ -852,9 +848,9 @@ mod cal {
             // without reflashing.
             while button.is_high() {
                 let _ = with_timeout(BUTTON_POLL, button.wait_for_low()).await;
-                let _ = drain(&mut imu, &mut saved).await;
+                let _ = drain(&mut imu, &mut compass).await;
             }
-            wait_for_release(&mut imu, &mut button, &mut saved).await;
+            wait_for_release(&mut imu, &mut button, &mut compass).await;
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Standalone demo binary for the BNO085 driver.
 //!
-//! Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
+//! Brings up the sensor hub over SPI, starts the compass's reports and
 //! shows, on the display and over RTT five times a second, the compass
 //! heading and elevation of the direction the LiDAR points, the roll of the
 //! breakout, and how far the hub trusts its compass. Kept separate from
@@ -15,13 +15,11 @@
 //! that of the breakout itself, with its printed +Y axis as forward; see
 //! [`Quaternion::to_euler`].
 //!
-//! The rotation vector takes its heading from the magnetometer, so it is a
-//! compass bearing rather than a turn from where the device started, but
-//! only once the magnetometer is calibrated: until the accuracy reads high,
-//! move the device in a slow figure of eight. The calibration is then saved
-//! to the hub so the next boot starts from it, and the accuracy line reads
-//! `saved` once the hub has confirmed the save.
+//! The heading is only a compass bearing once `imu_cal` has measured
+//! [`MAG_CALIBRATION`]. Until then the accuracy line reads `bad`; afterwards
+//! anything short of `high` means the field here is disturbed.
 //!
+//! [`MAG_CALIBRATION`]: ping_capstone::constants::MAG_CALIBRATION
 //! [`LIDAR_BORESIGHT`]: ping_capstone::constants::LIDAR_BORESIGHT
 //! [`HEADING_CORRECTION_DEG`]: ping_capstone::constants::HEADING_CORRECTION_DEG
 //! [`Quaternion::to_euler`]: ping_capstone::bno085::Quaternion::to_euler
@@ -174,9 +172,11 @@ mod imu {
     use esp_hal::spi::master::Spi;
     use ping_capstone::bno085::{Accuracy, Bno085, SensorData, SensorId, SpiTransport};
     use ping_capstone::constants::{
-        HEADING_CORRECTION_DEG, IMU_REPORT_INTERVAL_US, LCD_REFRESH, LIDAR_BORESIGHT, RETRY_DELAY,
+        HEADING_CORRECTION_DEG, IMU_REPORT_INTERVAL_US, LCD_REFRESH, LIDAR_BORESIGHT,
+        MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::geo::Aim;
+    use ping_capstone::mag_cal::Compass;
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
 
@@ -283,13 +283,19 @@ mod imu {
             }
         }
 
-        // The hub calibrates the accelerometer and magnetometer by default;
-        // asking for it makes sure, whatever an earlier program left set.
-        let started = match imu.configure_calibration(true, false, true).await {
-            Ok(()) => imu
-                .enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
+        // `imu_cal` calibrates the magnetometer; the hub keeps calibrating
+        // only what the game rotation vector relies on.
+        let started = match imu.configure_calibration(true, false, false).await {
+            Ok(()) => match imu
+                .enable_report(SensorId::GameRotationVector, IMU_REPORT_INTERVAL_US)
                 .await
-                .map_err(|error| ("report", error)),
+            {
+                Ok(()) => imu
+                    .enable_report(SensorId::MagneticFieldUncalibrated, MAG_REPORT_INTERVAL_US)
+                    .await
+                    .map_err(|error| ("report", error)),
+                Err(error) => Err(("report", error)),
+            },
             Err(error) => Err(("calibrate", error)),
         };
         if let Err((what, error)) = started {
@@ -305,11 +311,7 @@ mod imu {
             return;
         }
 
-        // Saved once, the first time the hub is confident in its
-        // calibration, so the next boot starts from it. A failed save is
-        // tried again after RETRY_DELAY rather than on the very next report.
-        let mut calibration_saved = false;
-        let mut next_save = Instant::now();
+        let mut compass = Compass::new(MAG_CALIBRATION);
         let mut next_refresh = Instant::now();
         loop {
             if let Err(error) = imu.wait_for_data().await {
@@ -325,47 +327,34 @@ mod imu {
             loop {
                 match imu.read_event().await {
                     Ok(Some(event)) => {
-                        let SensorData::RotationVector {
-                            quaternion,
-                            accuracy_rad,
-                        } = event.data
-                        else {
+                        match event.data {
+                            SensorData::MagneticFieldUncalibrated { field, .. } => {
+                                compass.update_field(field);
+                                continue;
+                            }
+                            SensorData::GameRotationVector(quaternion) => {
+                                compass.update_game(quaternion);
+                            }
+                            _ => continue,
+                        }
+                        let Some(heading) = compass.heading() else {
                             continue;
                         };
-                        if event.accuracy == Accuracy::High
-                            && !calibration_saved
-                            && Instant::now() >= next_save
-                        {
-                            match imu.save_calibration().await {
-                                Ok(()) => {
-                                    calibration_saved = true;
-                                    rprintln!("Compass calibrated; the IMU confirmed saving it");
-                                }
-                                Err(error) => {
-                                    next_save = Instant::now() + RETRY_DELAY;
-                                    rprintln!(
-                                        "Saving the compass calibration failed: {:?}; retrying",
-                                        error
-                                    );
-                                }
-                            }
-                        }
                         if !due(&mut next_refresh) {
                             continue;
                         }
 
                         let aim = Aim::from_orientation(
-                            &quaternion,
+                            &heading.quaternion,
                             LIDAR_BORESIGHT,
                             HEADING_CORRECTION_DEG,
                         );
-                        let roll_deg = quaternion.to_euler().roll_deg;
-                        let (accuracy, hint) = match event.accuracy {
-                            Accuracy::High if calibration_saved => ("high", " saved"),
-                            Accuracy::High => ("high", " saving"),
-                            Accuracy::Medium => ("med", " fig8"),
-                            Accuracy::Low => ("low", " fig8"),
-                            Accuracy::Unreliable => ("bad", " fig8"),
+                        let roll_deg = heading.quaternion.to_euler().roll_deg;
+                        let accuracy = match heading.status {
+                            Accuracy::High => "high",
+                            Accuracy::Medium => "med",
+                            Accuracy::Low => "low",
+                            Accuracy::Unreliable => "bad",
                         };
                         show(
                             &mut lcd,
@@ -378,10 +367,9 @@ mod imu {
                                 format_args!("elev {:>+7.1}°", aim.elevation_deg),
                                 format_args!("roll {:>+7.1}°", roll_deg),
                                 format_args!(
-                                    "{} ±{:.0}°{}",
+                                    "{} ±{:.0}°",
                                     accuracy,
-                                    accuracy_rad.to_degrees(),
-                                    hint
+                                    heading.accuracy_rad.to_degrees()
                                 ),
                             ],
                         )
