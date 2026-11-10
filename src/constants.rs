@@ -299,6 +299,10 @@ pub const FALLBACK_POSITION: Option<Position> = None;
 /// magnetometer can be watched calibrating.
 pub const COMPASS_LOG_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the GPS task logs its fix over RTT, so a fix can be watched
+/// arriving without the display.
+pub const GPS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
