@@ -45,7 +45,9 @@ pub struct Position {
 /// A direction from the device, relative to the local horizon.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Aim {
-    /// Compass bearing, degrees clockwise from true north, from 0 up to 360.
+    /// Compass bearing, degrees clockwise from north, from 0 up to 360. True
+    /// north once the heading correction has been measured; the IMU's
+    /// magnetic north while it is zero.
     pub azimuth_deg: f32,
     /// Degrees above the horizon, negative below it.
     pub elevation_deg: f32,
@@ -54,18 +56,20 @@ pub struct Aim {
 impl Aim {
     /// The direction `boresight` points, given the IMU's orientation.
     ///
-    /// `orientation` is the BNO085's rotation vector. The BNO085 uses
+    /// `orientation` is the compass's, in the BNO085's frames. The BNO085 uses
     /// Android's frames of reference, so the quaternion turns a vector in the
     /// sensor's own frame (the axes printed on the breakout) into a world
     /// frame whose X axis points east, Y to magnetic north and Z up.
     /// `boresight` is the direction the LiDAR looks, in the sensor's frame;
-    /// it need not be a unit vector. `declination_deg` is how far magnetic
-    /// north lies east of true north where the device is, which turns the
-    /// magnetic bearing into a true one.
+    /// it need not be a unit vector. `correction_deg` is added to the
+    /// bearing, positive clockwise: the measured difference between the
+    /// heading the IMU reports and a bearing that is known, which is what
+    /// turns the IMU's magnetic heading into a true one. Zero leaves the
+    /// IMU's own magnetic bearing.
     pub fn from_orientation(
         orientation: &Quaternion,
         boresight: Vec3,
-        declination_deg: f32,
+        correction_deg: f32,
     ) -> Self {
         let Quaternion {
             i: x,
@@ -93,7 +97,7 @@ impl Aim {
             + 2.0 * (y * z + w * x) * by
             + (w * w - x * x - y * y + z * z) * bz;
 
-        let mut azimuth_deg = atan2f(east, north).to_degrees() + declination_deg;
+        let mut azimuth_deg = atan2f(east, north).to_degrees() + correction_deg;
         if azimuth_deg < 0.0 {
             azimuth_deg += 360.0;
         }

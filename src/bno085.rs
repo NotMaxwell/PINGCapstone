@@ -36,6 +36,7 @@ pub mod reports;
 pub mod shtp;
 pub mod transport;
 
+use embassy_time::{Duration, Instant};
 use embedded_hal_async::delay::DelayNs;
 
 pub use reports::{Accuracy, Euler, Event, Quaternion, RawVec3, SensorData, SensorId, Vec3};
@@ -61,6 +62,7 @@ const MAX_TRANSFER: usize = 64;
 const MAX_WRITE: usize = 32;
 
 // Control channel report IDs.
+const REPORT_COMMAND_RESPONSE: u8 = 0xF1;
 const REPORT_COMMAND_REQUEST: u8 = 0xF2;
 const REPORT_PRODUCT_ID_RESPONSE: u8 = 0xF8;
 const REPORT_PRODUCT_ID_REQUEST: u8 = 0xF9;
@@ -76,6 +78,7 @@ const EXECUTABLE_RESET: u8 = 0x01;
 const COMMAND_TARE: u8 = 0x03;
 const COMMAND_SAVE_DCD: u8 = 0x06;
 const COMMAND_ME_CALIBRATE: u8 = 0x07;
+const COMMAND_CLEAR_DCD_AND_RESET: u8 = 0x0B;
 
 const TARE_NOW: u8 = 0x00;
 const TARE_PERSIST: u8 = 0x01;
@@ -118,6 +121,9 @@ pub enum Error<E> {
     Timeout,
     /// A packet arrived that does not fit the protocol.
     Protocol,
+    /// The hub answered a command with this non-zero status: it did not do
+    /// what was asked.
+    Rejected(u8),
 }
 
 /// Which reset the hub is reporting in its product ID response.
@@ -289,6 +295,11 @@ where
     pub async fn soft_reset(&mut self) -> Result<(), Error<T::Error>> {
         self.write_cargo(Channel::Executable, &[EXECUTABLE_RESET])
             .await?;
+        self.await_reset().await
+    }
+
+    /// Waits for the hub to come back up after being told to reset.
+    async fn await_reset(&mut self) -> Result<(), Error<T::Error>> {
         self.delay.delay_ms(BOOT_DELAY_MS).await;
 
         // A reset resets the hub's sequence numbers too.
@@ -334,7 +345,7 @@ where
             .await?;
 
         let len = self
-            .await_control_report(REPORT_PRODUCT_ID_RESPONSE, 16)
+            .await_control_report(REPORT_PRODUCT_ID_RESPONSE, 16, Self::response_deadline())
             .await?;
         let payload = &self.buf[HEADER_LEN..HEADER_LEN + len];
 
@@ -426,35 +437,62 @@ where
     ///
     /// The hub calibrates the accelerometer and magnetometer by default. Gyro
     /// calibration is worth enabling if the device spends time still.
+    ///
+    /// Waits for the hub to confirm, and fails with [`Error::Rejected`] if it
+    /// refuses, or with [`Error::Protocol`] if what it reports enabled is not
+    /// what was asked for.
     pub async fn configure_calibration(
         &mut self,
         accelerometer: bool,
         gyroscope: bool,
         magnetometer: bool,
     ) -> Result<(), Error<T::Error>> {
-        self.send_command(
-            COMMAND_ME_CALIBRATE,
-            &[
-                u8::from(accelerometer),
-                u8::from(gyroscope),
-                u8::from(magnetometer),
-                0, // subcommand 0: configure
-                0, // planar accelerometer calibration
-                0,
-                0,
-                0,
-                0,
-            ],
-        )
-        .await
+        // R1..R3 echo what the hub now has enabled.
+        let result = self
+            .command(
+                COMMAND_ME_CALIBRATE,
+                &[
+                    u8::from(accelerometer),
+                    u8::from(gyroscope),
+                    u8::from(magnetometer),
+                    0, // subcommand 0: configure
+                    0, // planar accelerometer calibration
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .await?;
+        let enabled = [result[1] != 0, result[2] != 0, result[3] != 0];
+        if enabled != [accelerometer, gyroscope, magnetometer] {
+            return Err(Error::Protocol);
+        }
+        Ok(())
     }
 
-    /// Saves the running calibration to flash.
+    /// Forgets the calibration the hub has learnt and resets it.
     ///
-    /// Worth doing once the hub reports [`Accuracy::High`], so the next boot
-    /// starts from a good calibration instead of relearning it.
+    /// CEVA documents this as clearing the copy in RAM, so what is in flash
+    /// is only replaced by the next [`Bno085::save_calibration`]. Reports
+    /// stop, as after any reset.
+    pub async fn clear_calibration(&mut self) -> Result<(), Error<T::Error>> {
+        self.send_command(COMMAND_CLEAR_DCD_AND_RESET, &[0; 9])
+            .await?;
+        self.await_reset().await
+    }
+
+    /// Saves the running calibration to flash, so the next boot starts from
+    /// it instead of relearning it.
+    ///
+    /// Waits for the hub to confirm the write, and fails with
+    /// [`Error::Rejected`] if it did not happen.
+    ///
+    /// Any reports left from the last [`Bno085::read_event`] packet are
+    /// dropped, because the reply is read into the same buffer.
     pub async fn save_calibration(&mut self) -> Result<(), Error<T::Error>> {
-        self.send_command(COMMAND_SAVE_DCD, &[0; 9]).await
+        self.command(COMMAND_SAVE_DCD, &[0; 9]).await?;
+        Ok(())
     }
 
     /// Sends a raw command request. See the SH-2 Reference Manual for the
@@ -472,6 +510,40 @@ where
         self.command_sequence = self.command_sequence.wrapping_add(1);
 
         self.write_cargo(Channel::Control, &payload).await
+    }
+
+    /// Sends a command and waits for the hub's response to it, which carries
+    /// a status in R0: zero for success. Returns R0..R10.
+    ///
+    /// Sensor reports that arrive in the meantime, and any still buffered,
+    /// are dropped.
+    async fn command(
+        &mut self,
+        command: u8,
+        params: &[u8; 9],
+    ) -> Result<[u8; 11], Error<T::Error>> {
+        self.discard_buffered();
+        let sequence = self.command_sequence;
+        self.send_command(command, params).await?;
+
+        let deadline = Self::response_deadline();
+        loop {
+            let len = self
+                .await_control_report(REPORT_COMMAND_RESPONSE, 16, deadline)
+                .await?;
+            let payload = &self.buf[HEADER_LEN..HEADER_LEN + len];
+            // Byte 2 is the command, with bit 7 set for one the hub sent on
+            // its own; byte 3 is the sequence number of the request answered.
+            if payload[2] != command || payload[3] != sequence {
+                continue;
+            }
+            let mut result = [0u8; 11];
+            result.copy_from_slice(&payload[5..16]);
+            return match result[0] {
+                0 => Ok(result),
+                status => Err(Error::Rejected(status)),
+            };
+        }
     }
 
     /// Waits until the hub has data waiting, then returns. Follow it with
@@ -573,15 +645,18 @@ where
     }
 
     /// Waits for a particular report to arrive on the control channel,
-    /// discarding anything else that turns up first. Returns the length of
-    /// the payload, which is left at `self.buf[HEADER_LEN..]`.
+    /// discarding anything else that turns up first, until `deadline`.
+    /// Returns the length of the payload, which is left at
+    /// `self.buf[HEADER_LEN..]`.
+    ///
+    /// The deadline is by the clock, not by time spent idle, because with
+    /// sensor reports streaming the hub always has something to send.
     async fn await_control_report(
         &mut self,
         report_id: u8,
         min_len: usize,
+        deadline: Instant,
     ) -> Result<usize, Error<T::Error>> {
-        let mut waited = 0;
-
         loop {
             match self.read_cargo().await {
                 Ok(Some(header)) => {
@@ -592,18 +667,20 @@ where
                         return Ok(header.payload_len());
                     }
                 }
-                Ok(None) => {
-                    self.delay.delay_ms(POLL_INTERVAL_MS).await;
-                    waited += POLL_INTERVAL_MS;
-                }
+                Ok(None) => self.delay.delay_ms(POLL_INTERVAL_MS).await,
                 Err(Error::CargoTooLarge(_)) => {}
                 Err(error) => return Err(error),
             }
 
-            if waited >= RESPONSE_TIMEOUT_MS {
+            if Instant::now() >= deadline {
                 return Err(Error::Timeout);
             }
         }
+    }
+
+    /// When to stop waiting for a response to something sent now.
+    fn response_deadline() -> Instant {
+        Instant::now() + Duration::from_millis(u64::from(RESPONSE_TIMEOUT_MS))
     }
 
     /// Frames a payload and sends it on `channel`.

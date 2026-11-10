@@ -88,6 +88,7 @@ use embassy_time::Duration;
 
 use crate::bno085::Vec3;
 use crate::geo::Position;
+use crate::mag_cal::MagCalibration;
 
 /// Takes the GPIO wired to a named signal out of esp-hal's `Peripherals`.
 ///
@@ -221,6 +222,9 @@ pub const GPS_RATE_HZ: u8 = 10;
 /// How often the IMU reports its orientation: every 10 ms, i.e. 100 Hz.
 pub const IMU_REPORT_INTERVAL_US: u32 = 10_000;
 
+/// How often the IMU reports the magnetic field: every 20 ms, i.e. 50 Hz.
+pub const MAG_REPORT_INTERVAL_US: u32 = 20_000;
+
 // ---------------------------------------------------------------------------
 // Aiming
 // ---------------------------------------------------------------------------
@@ -235,29 +239,45 @@ pub const LIDAR_BORESIGHT: Vec3 = Vec3 {
     z: 0.0,
 };
 
-/// How far magnetic north lies east of true north where the device is used,
-/// in degrees, negative for west. The IMU measures bearings from magnetic
-/// north, but coordinates are laid out from true north. Look the value up at
-/// <https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml>.
+/// The magnetometer's hard and soft iron correction, as `imu_cal` measures
+/// and prints it. `None` means it has not been calibrated: the device still
+/// reports a heading from the raw field, but marks it unreliable.
 ///
-/// Set for Huntsville, Alabama: 4.3° west from the World Magnetic Model
-/// (WMM2025) for late 2026. It drifts by about a tenth of a degree a year.
-pub const MAGNETIC_DECLINATION_DEG: f32 = -4.3;
+/// Calibrate again whenever anything magnetic near the IMU is added, moved
+/// or taken away. `docs/heading-calibration.md` is the procedure.
+pub const MAG_CALIBRATION: Option<MagCalibration> = None;
 
-/// A fixed trim added to every heading, in degrees, positive to turn it
-/// clockwise. It absorbs whatever stays constant once the declination is
-/// right: the IMU breakout sitting a little crooked against the direction
-/// the LiDAR looks, or a magnetometer bias the hub's calibration leaves
-/// behind. Keep it separate from [`MAGNETIC_DECLINATION_DEG`], which is a
-/// property of the place, not the device.
+/// Earth's field in Huntsville, Alabama, from the World Magnetic Model
+/// (WMM2025) for late 2026: total strength, µT, which the field `imu_cal`
+/// fits is checked against.
+pub const EXPECTED_FIELD_UT: f32 = 48.8;
+
+/// How far below the horizon that field points there, degrees.
+pub const EXPECTED_DIP_DEG: f32 = 62.6;
+
+/// Everything added to the heading the compass reports, in degrees, positive
+/// to turn the bearing clockwise.
 ///
-/// Measure it only once `compass_diag` shows the field at Earth's strength
-/// and dip, and set it to the average error over several headings: an error
-/// that changes with heading is magnetic interference, which no trim fixes.
-pub const HEADING_OFFSET_DEG: f32 = 0.0;
-
-/// Everything added to the IMU's magnetic heading to get a true bearing.
-pub const HEADING_CORRECTION_DEG: f32 = MAGNETIC_DECLINATION_DEG + HEADING_OFFSET_DEG;
+/// It starts as the magnetic declination in Huntsville, Alabama: 4.3° west,
+/// from the World Magnetic Model (WMM2025) for late 2026. The compass gives
+/// bearings from *magnetic* north, which read 4.3° high there, and left
+/// uncorrected would move a target about 7 m sideways at 100 m of range.
+/// It is only right near Huntsville.
+///
+/// `heading_cal` replaces this value rather than adding to it. It is one
+/// number rather than a magnetic model plus a trim. The
+/// error between what the device reports and a bearing that is known is the
+/// declination where the device is used, the IMU breakout sitting crooked
+/// against the direction the LiDAR looks, and whatever hard iron bias
+/// [`MAG_CALIBRATION`] leaves behind, all at once; nothing on the device can
+/// tell them apart, and only their sum changes a coordinate. Measuring the
+/// sum against known bearings is also the only form of it that can be checked
+/// against reality.
+///
+/// The `heading_cal` binary measures it and prints the value to put here.
+/// `docs/heading-calibration.md` is the procedure, and what to do when the
+/// error turns out not to be a constant.
+pub const HEADING_CORRECTION_DEG: f32 = -4.3;
 
 /// Where the device is taken to be while the GPS has no fix, so it can be
 /// tried out before the GPS has an antenna. A live fix is always used when
@@ -267,19 +287,21 @@ pub const HEADING_CORRECTION_DEG: f32 = MAGNETIC_DECLINATION_DEG + HEADING_OFFSE
 /// `None` so that a press without a fix reports no coordinate rather than
 /// one from the wrong place.
 ///
-/// The default is a made-up point for checking the projection math: round
-/// numbers, so a target's offset reads straight off its coordinate, and far
-/// enough from the equator (at 40° N a degree of longitude is 85 km against
-/// 111 km for latitude) that a mix-up between the two shows.
-pub const FALLBACK_POSITION: Option<Position> = Some(Position {
-    latitude_deg: 40.0,
-    longitude_deg: -90.0,
-    altitude_m: 200.0,
-});
+/// It is `None`: every coordinate comes from a live GPS fix. For checking the
+/// projection math without one, `Some(Position { latitude_deg: 40.0,
+/// longitude_deg: -90.0, altitude_m: 200.0 })` is a good made-up point:
+/// round numbers, so a target's offset reads straight off its coordinate,
+/// and far enough from the equator (at 40° N a degree of longitude is 85 km
+/// against 111 km for latitude) that a mix-up between the two shows.
+pub const FALLBACK_POSITION: Option<Position> = None;
 
 /// How often the IMU task logs the compass bearing over RTT, so the
 /// magnetometer can be watched calibrating.
 pub const COMPASS_LOG_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often the GPS task logs its fix over RTT, so a fix can be watched
+/// arriving without the display.
+pub const GPS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -293,9 +315,9 @@ pub const MAX_GPS_AGE: Duration = Duration::from_secs(2);
 pub const MAX_IMU_AGE: Duration = Duration::from_millis(250);
 pub const MAX_LIDAR_AGE: Duration = Duration::from_millis(250);
 
-/// A GPS this long without a solution has probably lost power, and with it
-/// its configuration, which lives in RAM. The GPS task then configures it
-/// again.
+/// A GPS this long without a solution has probably lost power for longer
+/// than its backup supply lasts, and with it its configuration. The GPS task
+/// then configures it again.
 pub const GPS_SILENCE: Duration = Duration::from_secs(3);
 
 /// An IMU this long without a report has probably reset, which stops every

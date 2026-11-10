@@ -1,23 +1,27 @@
 //! Diagnostic binary for the BNO085's compass: finds out why the heading is
 //! wrong.
 //!
-//! A heading is only as good as the magnetic field the hub measures. Twice a
+//! A heading is only as good as the magnetic field it is taken from. Twice a
 //! second this prints, over RTT:
 //!
-//! * the calibrated field's strength and dip, against Earth's field where
-//!   the device is ([`EXPECTED_FIELD_UT`], [`EXPECTED_DIP_DEG`]). A field that
-//!   is too strong or too weak, or dips at the wrong angle, means something
-//!   near the IMU is bending it, and no calibration will make the heading
-//!   right;
-//! * the hard iron correction the hub has learnt, which is how strongly
-//!   magnetised the things that move with the IMU are;
-//! * the heading of the breakout's +Y axis four ways: the fused rotation
-//!   vector the application uses, the geomagnetic rotation vector (magnet and
-//!   accelerometer only), one worked out here from the raw field and gravity,
-//!   and the game rotation vector (gyroscope only, so relative to where it
-//!   started). The first three should agree once the compass is calibrated.
+//! * the corrected field's strength and dip, against Earth's field where the
+//!   device is ([`EXPECTED_FIELD_UT`], [`EXPECTED_DIP_DEG`]). A field that is
+//!   too strong or too weak, or dips at the wrong angle, means something near
+//!   the IMU is bending it, or [`MAG_CALIBRATION`] no longer fits;
+//! * the raw field's strength and the hard iron offset in use, which is how
+//!   strongly magnetised the things that move with the IMU are;
+//! * the hub's own hard iron estimate, which should stay near zero because
+//!   its magnetometer calibration is off;
+//! * the heading of the breakout's +Y axis three ways: the compass the
+//!   application uses, one worked out here from the corrected field and
+//!   gravity, and the game rotation vector (gyroscope only, so relative to
+//!   where it started). The first two should agree.
 //!
 //! All headings are magnetic: no declination or trim is applied.
+//!
+//! [`EXPECTED_FIELD_UT`]: ping_capstone::constants::EXPECTED_FIELD_UT
+//! [`EXPECTED_DIP_DEG`]: ping_capstone::constants::EXPECTED_DIP_DEG
+//! [`MAG_CALIBRATION`]: ping_capstone::constants::MAG_CALIBRATION
 
 #![no_std]
 #![no_main]
@@ -50,12 +54,6 @@ fn panic(panic_info: &core::panic::PanicInfo) -> ! {
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
-
-/// Earth's field in Huntsville, Alabama, from the World Magnetic Model
-/// (WMM2025) for late 2026: total strength, µT, and how far below the
-/// horizon it points, degrees.
-const EXPECTED_FIELD_UT: f32 = 48.8;
-const EXPECTED_DIP_DEG: f32 = 62.6;
 
 #[allow(
     clippy::large_stack_frames,
@@ -125,16 +123,16 @@ mod diag {
     //! relaxed: the driver's buffers live in the task's static future.
     #![allow(clippy::large_stack_frames)]
 
-    use super::{EXPECTED_DIP_DEG, EXPECTED_FIELD_UT};
     use embassy_time::{Delay, Duration, Instant, Timer};
     use esp_hal::Async;
     use esp_hal::gpio::{Input, Output};
     use esp_hal::spi::master::Spi;
     use libm::{asinf, atan2f, sqrtf};
-    use ping_capstone::bno085::{
-        Accuracy, Bno085, Quaternion, SensorData, SensorId, SpiTransport, Vec3,
+    use ping_capstone::bno085::{Bno085, Quaternion, SensorData, SensorId, SpiTransport, Vec3};
+    use ping_capstone::constants::{
+        EXPECTED_DIP_DEG, EXPECTED_FIELD_UT, MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
-    use ping_capstone::constants::RETRY_DELAY;
+    use ping_capstone::mag_cal::{Compass, Heading};
     use rtt_target::rprintln;
 
     type Imu = Bno085<
@@ -148,16 +146,12 @@ mod diag {
         Delay,
     >;
 
-    /// Every report this asks for, 20 times a second.
-    const SENSORS: [SensorId; 6] = [
-        SensorId::RotationVector,
-        SensorId::GeomagneticRotationVector,
+    /// Every report this asks for.
+    const SENSORS: [SensorId; 3] = [
         SensorId::GameRotationVector,
-        SensorId::MagneticFieldCalibrated,
         SensorId::MagneticFieldUncalibrated,
         SensorId::Gravity,
     ];
-    const INTERVAL_US: u32 = 50_000;
     const PRINT_EVERY: Duration = Duration::from_millis(500);
 
     fn dot(a: Vec3, b: Vec3) -> f32 {
@@ -177,84 +171,86 @@ mod diag {
         if deg < 0.0 { deg + 360.0 } else { deg }
     }
 
-    /// The latest of each report.
-    #[derive(Default)]
+    /// The latest of each report, with the compass built from them.
     struct Latest {
-        fused: Option<(Quaternion, f32, Accuracy)>,
-        geomagnetic: Option<(Quaternion, f32, Accuracy)>,
+        compass: Compass,
         game: Option<Quaternion>,
-        field: Option<(Vec3, Accuracy)>,
+        raw: Option<Vec3>,
         bias: Option<Vec3>,
         gravity: Option<Vec3>,
     }
 
-    fn print(latest: &Latest, started: Instant) {
+    fn print(latest: &Latest, heading: Option<Heading>, started: Instant) {
         rprintln!(
             "---- t={:.1}s",
             started.elapsed().as_millis() as f32 / 1000.0
         );
 
-        if let (Some((field, accuracy)), Some(gravity)) = (latest.field, latest.gravity) {
-            // Gravity as the hub reports it points up, like an accelerometer
-            // at rest; down is the opposite.
-            let strength = norm(field);
-            let up = Vec3 {
-                x: gravity.x / norm(gravity),
-                y: gravity.y / norm(gravity),
-                z: gravity.z / norm(gravity),
-            };
-            let dip = asinf(-dot(field, up) / strength).to_degrees();
-            // Magnetic north is the field with its vertical part taken out;
-            // east is north × up. The heading of +Y is then where +Y's own
-            // horizontal part falls between them.
-            let vertical = dot(field, up);
-            let north = Vec3 {
-                x: field.x - vertical * up.x,
-                y: field.y - vertical * up.y,
-                z: field.z - vertical * up.z,
-            };
-            let east = cross(north, up);
-            let heading = bearing(atan2f(east.y, north.y).to_degrees());
-            rprintln!(
-                "field {:5.1} uT (expect {:.1})  horizontal {:5.1} uT  dip {:5.1} deg (expect {:.1})  status {:?}  -> raw heading {:5.1}",
-                strength,
-                EXPECTED_FIELD_UT,
-                norm(north),
-                dip,
-                EXPECTED_DIP_DEG,
-                accuracy,
-                heading
-            );
-            rprintln!(
-                "      field xyz {:6.1} {:6.1} {:6.1} uT",
-                field.x,
-                field.y,
-                field.z
-            );
+        if let Some(raw) = latest.raw {
+            let field = MAG_CALIBRATION.map_or(raw, |c| c.apply(raw));
+            match MAG_CALIBRATION {
+                Some(c) => rprintln!(
+                    "raw field {:5.1} uT, hard iron offset in use {:5.1} uT",
+                    norm(raw),
+                    norm(Vec3 {
+                        x: c.offset[0],
+                        y: c.offset[1],
+                        z: c.offset[2],
+                    })
+                ),
+                None => rprintln!(
+                    "raw field {:5.1} uT, NOT CALIBRATED: run imu_cal",
+                    norm(raw)
+                ),
+            }
+
+            if let Some(gravity) = latest.gravity {
+                // Gravity as the hub reports it points up, like an
+                // accelerometer at rest; down is the opposite.
+                let strength = norm(field);
+                let up = Vec3 {
+                    x: gravity.x / norm(gravity),
+                    y: gravity.y / norm(gravity),
+                    z: gravity.z / norm(gravity),
+                };
+                let dip = asinf(-dot(field, up) / strength).to_degrees();
+                // Magnetic north is the field with its vertical part taken
+                // out; east is north × up. The heading of +Y is then where
+                // +Y's own horizontal part falls between them.
+                let vertical = dot(field, up);
+                let north = Vec3 {
+                    x: field.x - vertical * up.x,
+                    y: field.y - vertical * up.y,
+                    z: field.z - vertical * up.z,
+                };
+                let east = cross(north, up);
+                let tilt_heading = bearing(atan2f(east.y, north.y).to_degrees());
+                rprintln!(
+                    "field {:5.1} uT (expect {:.1})  horizontal {:5.1} uT  dip {:5.1} deg (expect {:.1})  -> heading {:5.1}",
+                    strength,
+                    EXPECTED_FIELD_UT,
+                    norm(north),
+                    dip,
+                    EXPECTED_DIP_DEG,
+                    tilt_heading
+                );
+            }
         }
         if let Some(bias) = latest.bias {
             rprintln!(
-                "hard iron correction {:5.1} uT  ({:6.1} {:6.1} {:6.1})",
+                "hub's hard iron estimate {:5.1} uT  ({:6.1} {:6.1} {:6.1})",
                 norm(bias),
                 bias.x,
                 bias.y,
                 bias.z
             );
         }
-        if let Some((q, accuracy, status)) = latest.fused {
+        if let Some(heading) = heading {
             rprintln!(
-                "rotation vector (app)   heading {:5.1}  +/-{:5.1}  {:?}",
-                q.to_euler().yaw_deg,
-                accuracy.to_degrees(),
-                status
-            );
-        }
-        if let Some((q, accuracy, status)) = latest.geomagnetic {
-            rprintln!(
-                "geomagnetic (no gyro)   heading {:5.1}  +/-{:5.1}  {:?}",
-                q.to_euler().yaw_deg,
-                accuracy.to_degrees(),
-                status
+                "compass (app)           heading {:5.1}  +/-{:5.1}  {:?}",
+                heading.quaternion.to_euler().yaw_deg,
+                heading.accuracy_rad.to_degrees(),
+                heading.status
             );
         }
         if let Some(q) = latest.game {
@@ -285,14 +281,24 @@ mod diag {
                 }
             }
         }
+        // The same configuration the application uses.
+        if let Err(error) = imu.configure_calibration(true, false, false).await {
+            rprintln!("Configuring calibration failed: {:?}", error);
+        }
         for sensor in SENSORS {
-            if let Err(error) = imu.enable_report(sensor, INTERVAL_US).await {
+            if let Err(error) = imu.enable_report(sensor, MAG_REPORT_INTERVAL_US).await {
                 rprintln!("Enabling {:?} failed: {:?}", sensor, error);
             }
         }
 
         let started = Instant::now();
-        let mut latest = Latest::default();
+        let mut latest = Latest {
+            compass: Compass::new(MAG_CALIBRATION),
+            game: None,
+            raw: None,
+            bias: None,
+            gravity: None,
+        };
         let mut next_print = started + PRINT_EVERY;
         loop {
             if let Err(error) = imu.wait_for_data().await {
@@ -303,22 +309,14 @@ mod diag {
             loop {
                 match imu.read_event().await {
                     Ok(Some(event)) => match event.data {
-                        SensorData::RotationVector {
-                            quaternion,
-                            accuracy_rad,
-                        } => latest.fused = Some((quaternion, accuracy_rad, event.accuracy)),
-                        SensorData::GeomagneticRotationVector {
-                            quaternion,
-                            accuracy_rad,
-                        } => latest.geomagnetic = Some((quaternion, accuracy_rad, event.accuracy)),
                         SensorData::GameRotationVector(quaternion) => {
-                            latest.game = Some(quaternion)
+                            latest.compass.update_game(quaternion);
+                            latest.game = Some(quaternion);
                         }
-                        SensorData::MagneticField(field) => {
-                            latest.field = Some((field, event.accuracy))
-                        }
-                        SensorData::MagneticFieldUncalibrated { bias, .. } => {
-                            latest.bias = Some(bias)
+                        SensorData::MagneticFieldUncalibrated { field, bias } => {
+                            latest.compass.update_field(field);
+                            latest.raw = Some(field);
+                            latest.bias = Some(bias);
                         }
                         SensorData::Gravity(gravity) => latest.gravity = Some(gravity),
                         _ => {}
@@ -332,7 +330,7 @@ mod diag {
             }
             if Instant::now() >= next_print {
                 next_print += PRINT_EVERY;
-                print(&latest, started);
+                print(&latest, latest.compass.heading(), started);
             }
         }
     }

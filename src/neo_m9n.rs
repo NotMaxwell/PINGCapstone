@@ -24,9 +24,13 @@
 //!
 //! The M9 generation is configured with key/value pairs (`UBX-CFG-VALSET`);
 //! the older `CFG-PRT`/`CFG-MSG` messages are gone. [`NeoM9n::configure`]
-//! writes to the RAM layer only, so nothing is left behind in the receiver's
-//! flash and a fresh board and a reused one behave the same after a power
-//! cycle. Call it once at start-up.
+//! writes to the RAM and battery-backed RAM (BBR) layers. The receiver
+//! restarts on its own when its supply dips, and comes back from BBR with its
+//! satellite data and this configuration intact, so it carries on sending
+//! NAV-PVT without being configured again. BBR only lasts while the board's
+//! backup supply holds, so a long power cut still puts the receiver back to
+//! factory settings; nothing is written to flash. Call it at start-up, and
+//! again if the solutions stop.
 //!
 //! # Example
 //!
@@ -418,7 +422,7 @@ impl<U: Read + Write> NeoM9n<U> {
     /// Switches UART1 to UBX-only output and sets the receiver to send one
     /// `UBX-NAV-PVT` per solution, `rate_hz` solutions a second.
     ///
-    /// Written to RAM only; see the module documentation. `rate_hz` must be
+    /// Written to RAM and BBR; see the module documentation. `rate_hz` must be
     /// between 1 and [`MAX_NAV_RATE_HZ`].
     pub async fn configure(&mut self, rate_hz: u8) -> Result<(), Error<U::Error>> {
         if !(1..=MAX_NAV_RATE_HZ).contains(&rate_hz) {
@@ -440,7 +444,7 @@ impl<U: Read + Write> NeoM9n<U> {
         let mut writer = FrameWriter::<CONFIG_BUF>::new();
         CfgValSetBuilder {
             version: 0,
-            layers: CfgLayerSet::RAM,
+            layers: CfgLayerSet::RAM.union(CfgLayerSet::BBR),
             reserved1: 0,
             cfg_data: &settings,
         }

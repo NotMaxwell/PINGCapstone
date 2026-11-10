@@ -22,15 +22,17 @@
 //! GPS state, and after each press the target's coordinate for
 //! [`TARGET_HOLD`].
 //!
-//! Before trusting the bearings, set [`LIDAR_BORESIGHT`] to how the LiDAR is
-//! mounted against the IMU, [`MAGNETIC_DECLINATION_DEG`] to where the device
-//! is used and [`HEADING_OFFSET_DEG`] to whatever error is left after that.
-//! All three live in [`ping_capstone::constants`], with the pin map and every
-//! other fixed setting.
+//! The bearings come from the compass in [`ping_capstone::mag_cal`], which
+//! needs `imu_cal` to have measured `MAG_CALIBRATION`. They are measured
+//! from true north using [`HEADING_CORRECTION_DEG`], which starts as the
+//! magnetic declination in Huntsville. The `heading_cal` binary measures it
+//! against bearings that are known, which also takes in mounting error, and
+//! `docs/heading-calibration.md` is the procedure. [`LIDAR_BORESIGHT`] says
+//! how the LiDAR is mounted against the IMU. Both live in
+//! [`ping_capstone::constants`], with the pin map and every other fixed
+//! setting.
 //!
-//! [`MAGNETIC_DECLINATION_DEG`]: ping_capstone::constants::MAGNETIC_DECLINATION_DEG
 //! [`TARGET_HOLD`]: ping_capstone::constants::TARGET_HOLD
-//! [`HEADING_OFFSET_DEG`]: ping_capstone::constants::HEADING_OFFSET_DEG
 
 #![no_std]
 #![no_main]
@@ -406,7 +408,7 @@ impl<T: Copy> Latest<T> {
     }
 }
 
-/// What the IMU task keeps from each rotation vector report.
+/// What the IMU task keeps from each compass update.
 #[derive(Clone, Copy)]
 struct Orientation {
     quaternion: Quaternion,
@@ -477,10 +479,11 @@ mod sensors {
         self, Accuracy, Bno085, ProductId, SensorData, SensorId, SpiTransport,
     };
     use ping_capstone::constants::{
-        COMPASS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE,
-        RETRY_DELAY,
+        COMPASS_LOG_INTERVAL, GPS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US,
+        IMU_SILENCE, MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
-    use ping_capstone::neo_m9n::NeoM9n;
+    use ping_capstone::mag_cal::{Compass, StartupCalibration};
+    use ping_capstone::neo_m9n::{NeoM9n, Solution};
     use ping_capstone::tf03::Tf03;
     use rtt_target::rprintln;
 
@@ -497,10 +500,12 @@ mod sensors {
     /// Keeps the latest navigation solution from the NEO-M9N.
     #[embassy_executor::task]
     pub async fn gps_task(mut gps: NeoM9n<Uart<'static, Async>>) {
+        let mut next_log = Instant::now();
         loop {
-            // The configuration lives in the receiver's RAM, so this runs
-            // again whenever the receiver goes quiet, in case a power glitch
-            // has put it back to its factory NMEA output.
+            // The configuration survives a restart only while the
+            // receiver's backup supply holds, so this runs again whenever
+            // the receiver goes quiet, in case it is back to its factory
+            // NMEA output.
             while let Err(error) = gps.configure(GPS_RATE_HZ).await {
                 rprintln!("GPS configuration failed: {:?}, retrying", error);
                 Timer::after(RETRY_DELAY).await;
@@ -509,7 +514,13 @@ mod sensors {
 
             loop {
                 match with_timeout(GPS_SILENCE, gps.read()).await {
-                    Ok(Ok(solution)) => GPS.set(solution),
+                    Ok(Ok(solution)) => {
+                        GPS.set(solution);
+                        if Instant::now() >= next_log {
+                            next_log = Instant::now() + GPS_LOG_INTERVAL;
+                            log_gps(&solution);
+                        }
+                    }
                     // Typically an RX FIFO overflow; the parser
                     // resynchronises on the next frame, so carry on reading.
                     Ok(Err(error)) => rprintln!("GPS read failed: {:?}", error),
@@ -519,6 +530,23 @@ mod sensors {
                     }
                 }
             }
+        }
+    }
+
+    /// Logs the GPS's fix. The satellite count is those used in the fix, so
+    /// it reads 0 until there is one, however many are being tracked;
+    /// `gps_diag` shows those.
+    fn log_gps(solution: &Solution) {
+        match solution.position() {
+            Some((latitude, longitude)) => rprintln!(
+                "GPS: {:?}, {} satellites, {:.7}, {:.7} +/-{:.1} m",
+                solution.fix_type,
+                solution.satellites,
+                latitude,
+                longitude,
+                solution.horizontal_accuracy_m
+            ),
+            None => rprintln!("GPS: no fix yet ({:?})", solution.fix_type),
         }
     }
 
@@ -545,9 +573,9 @@ mod sensors {
                 }
             }
 
-            // Saved once per start, the first time the hub is confident in
-            // its calibration, so the next boot starts from it.
-            let mut calibration_saved = false;
+            // The game rotation vector's frame starts over with the hub.
+            let mut compass = Compass::new(MAG_CALIBRATION);
+            let mut startup = StartupCalibration::new(MAG_CALIBRATION.map(|c| c.matrix));
             let mut next_log = Instant::now();
             'reporting: loop {
                 match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {
@@ -564,16 +592,30 @@ mod sensors {
 
                 loop {
                     match imu.read_event().await {
-                        Ok(Some(event)) => {
-                            if let SensorData::RotationVector {
-                                quaternion,
-                                accuracy_rad,
-                            } = event.data
-                            {
+                        Ok(Some(event)) => match event.data {
+                            SensorData::MagneticFieldUncalibrated { field, .. } => {
+                                compass.update_field(field);
+                                if let Some(found) = startup.add(field) {
+                                    rprintln!(
+                                        "Compass calibrated from handling: hard iron {:.1} {:.1} {:.1} uT, field {:.1} uT, residual {:.4}",
+                                        found.offset[0],
+                                        found.offset[1],
+                                        found.offset[2],
+                                        found.field_ut,
+                                        found.residual
+                                    );
+                                    compass.set_calibration(found);
+                                }
+                            }
+                            SensorData::GameRotationVector(quaternion) => {
+                                compass.update_game(quaternion);
+                                let Some(heading) = compass.heading() else {
+                                    continue;
+                                };
                                 let orientation = Orientation {
-                                    quaternion,
-                                    heading_accuracy_rad: accuracy_rad,
-                                    calibration: event.accuracy,
+                                    quaternion: heading.quaternion,
+                                    heading_accuracy_rad: heading.accuracy_rad,
+                                    calibration: heading.status,
                                 };
                                 IMU.set(orientation);
 
@@ -581,18 +623,9 @@ mod sensors {
                                     next_log = Instant::now() + COMPASS_LOG_INTERVAL;
                                     log_compass(&orientation);
                                 }
-                                if event.accuracy == Accuracy::High && !calibration_saved {
-                                    calibration_saved = true;
-                                    match imu.save_calibration().await {
-                                        Ok(()) => rprintln!("Compass calibrated; saved to the IMU"),
-                                        Err(error) => rprintln!(
-                                            "Saving the compass calibration failed: {:?}",
-                                            error
-                                        ),
-                                    }
-                                }
                             }
-                        }
+                            _ => {}
+                        },
                         // Nothing left waiting; go back to the interrupt pin.
                         Ok(None) => break,
                         // A hub that resets on its own announces it with a
@@ -609,16 +642,15 @@ mod sensors {
         }
     }
 
-    /// Resets the hub and starts its rotation vector.
+    /// Resets the hub and starts the reports the compass is built from.
     async fn start(imu: &mut Imu) -> Result<ProductId, ImuError> {
         let id = imu.init().await?;
-        // The rotation vector takes its heading from the magnetometer, so it
-        // is a compass bearing rather than a turn from where the device
-        // started, but only once the magnetometer is calibrated. The hub
-        // calibrates the accelerometer and magnetometer by default; asking
-        // for it makes sure, whatever an earlier program left set.
-        imu.configure_calibration(true, false, true).await?;
-        imu.enable_report(SensorId::RotationVector, IMU_REPORT_INTERVAL_US)
+        // `imu_cal` calibrates the magnetometer; the hub keeps calibrating
+        // only what the game rotation vector relies on.
+        imu.configure_calibration(true, false, false).await?;
+        imu.enable_report(SensorId::GameRotationVector, IMU_REPORT_INTERVAL_US)
+            .await?;
+        imu.enable_report(SensorId::MagneticFieldUncalibrated, MAG_REPORT_INTERVAL_US)
             .await?;
         Ok(id)
     }
@@ -636,7 +668,7 @@ mod sensors {
             if orientation.calibration == Accuracy::High {
                 ""
             } else {
-                " (move the device in a slow figure of eight to calibrate)"
+                " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)"
             }
         );
     }
@@ -777,9 +809,9 @@ mod display {
                             "cal high ±{:.0}°",
                             orientation.heading_accuracy_rad.to_degrees()
                         ),
-                        Accuracy::Medium => String::from("cal med - fig 8"),
-                        Accuracy::Low => String::from("cal low - fig 8"),
-                        Accuracy::Unreliable => String::from("cal bad - fig 8"),
+                        Accuracy::Medium => String::from("cal med"),
+                        Accuracy::Low => String::from("cal low"),
+                        Accuracy::Unreliable => String::from("cal bad - move"),
                     },
                 )
             }
