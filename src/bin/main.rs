@@ -483,7 +483,7 @@ mod sensors {
         MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::mag_cal::{Compass, StartupCalibration};
-    use ping_capstone::neo_m9n::NeoM9n;
+    use ping_capstone::neo_m9n::{NeoM9n, Solution};
     use ping_capstone::tf03::Tf03;
     use rtt_target::rprintln;
 
@@ -523,6 +523,23 @@ mod sensors {
                     }
                 }
             }
+        }
+    }
+
+    /// Logs the GPS's fix. The satellite count is those used in the fix, so
+    /// it reads 0 until there is one, however many are being tracked;
+    /// `gps_diag` shows those.
+    fn log_gps(solution: &Solution) {
+        match solution.position() {
+            Some((latitude, longitude)) => rprintln!(
+                "GPS: {:?}, {} satellites, {:.7}, {:.7} +/-{:.1} m",
+                solution.fix_type,
+                solution.satellites,
+                latitude,
+                longitude,
+                solution.horizontal_accuracy_m
+            ),
+            None => rprintln!("GPS: no fix yet ({:?})", solution.fix_type),
         }
     }
 
