@@ -479,8 +479,8 @@ mod sensors {
         self, Accuracy, Bno085, ProductId, SensorData, SensorId, SpiTransport,
     };
     use ping_capstone::constants::{
-        COMPASS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US, IMU_SILENCE,
-        MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
+        COMPASS_LOG_INTERVAL, GPS_LOG_INTERVAL, GPS_RATE_HZ, GPS_SILENCE, IMU_REPORT_INTERVAL_US,
+        IMU_SILENCE, MAG_CALIBRATION, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::mag_cal::{Compass, StartupCalibration};
     use ping_capstone::neo_m9n::{NeoM9n, Solution};
@@ -500,6 +500,7 @@ mod sensors {
     /// Keeps the latest navigation solution from the NEO-M9N.
     #[embassy_executor::task]
     pub async fn gps_task(mut gps: NeoM9n<Uart<'static, Async>>) {
+        let mut next_log = Instant::now();
         loop {
             // The configuration survives a restart only while the
             // receiver's backup supply holds, so this runs again whenever
@@ -513,7 +514,13 @@ mod sensors {
 
             loop {
                 match with_timeout(GPS_SILENCE, gps.read()).await {
-                    Ok(Ok(solution)) => GPS.set(solution),
+                    Ok(Ok(solution)) => {
+                        GPS.set(solution);
+                        if Instant::now() >= next_log {
+                            next_log = Instant::now() + GPS_LOG_INTERVAL;
+                            log_gps(&solution);
+                        }
+                    }
                     // Typically an RX FIFO overflow; the parser
                     // resynchronises on the next frame, so carry on reading.
                     Ok(Err(error)) => rprintln!("GPS read failed: {:?}", error),
