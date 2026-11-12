@@ -431,17 +431,36 @@ mod cal {
             MAX_RESIDUAL
         );
 
-        if sectors < REQUIRED_SECTORS {
-            Some("too few directions")
-        } else if calibration.residual > MAX_RESIDUAL {
-            Some("residual too big")
-        } else if (calibration.field_ut - EXPECTED_FIELD_UT).abs()
-            > FIELD_TOLERANCE * EXPECTED_FIELD_UT
-        {
-            Some("wrong field")
-        } else {
-            None
+        // Every failure is printed, worst first; the display has room for
+        // only the first.
+        let problems = [
+            (
+                calibration.residual > MAX_RESIDUAL,
+                "residual too big",
+                "the readings do not lie on one ellipsoid, so the field changed during the \
+                 run: the device was moved near iron or a laptop, a magnet near the IMU shifted, \
+                 or a current changed",
+            ),
+            (
+                (calibration.field_ut - EXPECTED_FIELD_UT).abs()
+                    > FIELD_TOLERANCE * EXPECTED_FIELD_UT,
+                "wrong field",
+                "something near the device adds to Earth's field",
+            ),
+            (
+                sectors < REQUIRED_SECTORS,
+                "too few directions",
+                "turn it through more orientations",
+            ),
+        ];
+        let mut first = None;
+        for (failed, short, why) in problems {
+            if failed {
+                rprintln!("Problem: {}: {}.", short, why);
+                first.get_or_insert(short);
+            }
         }
+        first
     }
 
     /// Prints the calibration in the form it goes in `constants.rs`.
