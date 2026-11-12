@@ -92,8 +92,8 @@ needs nothing but the display:
 
 1. **Rest it with the named face up** (`+X up`, `-X up`, `+Y up`, `-Y up`,
    `+Z up`, `-Z up`, using the axes printed on the breakout). It starts on its
-   own once the face is within 10° of straight up and still for a second and
-   a half. Propping it against a box works better than holding it.
+   own once the face is within 20° of straight up and steady for a second;
+   until then the display shows how far it leans. Propping it against a box works better than holding it.
 2. **Figure of eight for five seconds**, when the display counts down.
 3. After the sixth face, **tumble it slowly through every direction** until
    `cover` reaches 24 of 26.

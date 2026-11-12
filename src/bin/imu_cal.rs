@@ -136,7 +136,6 @@ mod cal {
     #![allow(clippy::large_stack_frames)]
 
     use alloc::format;
-    use alloc::string::String;
     use core::fmt;
 
     use embassy_time::{Delay, Duration, Instant, Timer, with_timeout};
@@ -144,7 +143,7 @@ mod cal {
     use esp_hal::gpio::{Input, Output};
     use esp_hal::i2c::master::I2c;
     use esp_hal::spi::master::Spi;
-    use libm::sqrtf;
+    use libm::{acosf, sqrtf};
     use ping_capstone::bno085::{Bno085, SensorData, SensorId, SpiTransport, Vec3};
     use ping_capstone::constants::{
         EXPECTED_FIELD_UT, IMU_SILENCE, LCD_REFRESH, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
@@ -180,15 +179,17 @@ mod cal {
         ("-Z up", [0.0, 0.0, -1.0]),
     ];
 
-    /// How many accelerometer readings must be held still: 1.5 s at
+    /// How many accelerometer readings must be held still: 1 s at
     /// [`MAG_REPORT_INTERVAL_US`].
-    const HOLD_SAMPLES: u32 = 75;
-    /// The most any axis may wander, m/s², and still count as held still.
-    const STILL_LIMIT: f32 = 0.25;
-    /// How closely the face must point up: cos 10°. A six point check reads
-    /// the projection of gravity on each axis, so a tilt reads as a scale
-    /// error.
-    const ALIGNED: f32 = 0.985;
+    const HOLD_SAMPLES: u32 = 50;
+    /// The most any axis may wander, m/s², and still count as held still:
+    /// loose enough for a hand-held device, which trembles by a few tenths.
+    const STILL_LIMIT: f32 = 0.8;
+    /// How far the face may lean from straight up, degrees. Generous because
+    /// an uncalibrated accelerometer can be several degrees off by itself.
+    /// The six point check reads the projection of gravity on each axis, so
+    /// a lean costs it up to 0.3 m/s² of bias and 6% of scale.
+    const ALIGNED_DEG: f32 = 20.0;
     /// How long to move the device about at each face.
     const SWEEP: Duration = Duration::from_secs(5);
     /// Standard gravity, m/s².
@@ -299,9 +300,14 @@ mod cal {
         }
     }
 
-    fn aligned(accel: Vec3, up: [f32; 3]) -> bool {
+    /// How far the face `up` is from pointing straight up, degrees.
+    fn lean_deg(accel: Vec3, up: [f32; 3]) -> f32 {
         let length = sqrtf(accel.x * accel.x + accel.y * accel.y + accel.z * accel.z);
-        length > 0.0 && (accel.x * up[0] + accel.y * up[1] + accel.z * up[2]) / length > ALIGNED
+        if length == 0.0 {
+            return 180.0;
+        }
+        let along = (accel.x * up[0] + accel.y * up[1] + accel.z * up[2]) / length;
+        acosf(along.clamp(-1.0, 1.0)).to_degrees()
     }
 
     /// Waits for the device to be held still with this face up. Returns the
@@ -324,7 +330,8 @@ mod cal {
         let mut next_refresh = Instant::now();
         loop {
             let accel = next_accel(imu, readings).await;
-            let on_face = aligned(accel, up);
+            let lean = lean_deg(accel, up);
+            let on_face = lean <= ALIGNED_DEG;
             if on_face {
                 hold.add(accel);
             } else {
@@ -337,9 +344,9 @@ mod cal {
                 // Built first: a format_args! lives only to the end of the
                 // statement that makes it, so one cannot come out of an `if`.
                 let status = if on_face {
-                    format!("hold still {}/{}", hold.count / 15, HOLD_SAMPLES / 15)
+                    format!("hold still {}/5", hold.count * 5 / HOLD_SAMPLES)
                 } else {
-                    String::from("turn to face")
+                    format!("lean {lean:.0} deg>{ALIGNED_DEG:.0}")
                 };
                 show_quietly(
                     lcd,
