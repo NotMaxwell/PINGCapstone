@@ -94,7 +94,9 @@ needs nothing but the display:
    `+Z up`, `-Z up`, using the axes printed on the breakout). It starts on its
    own once the face is within 20° of straight up and steady for a second;
    until then the display shows how far it leans. Propping it against a box works better than holding it.
-2. **Figure of eight for five seconds**, when the display counts down.
+2. **Turn it every way you can for five seconds**, when the display counts
+   down: hand in one place, wrist tipping, rolling and turning the device.
+   Rotation is what counts; carrying it around does nothing useful.
 3. After the sixth face, **tumble it slowly through every direction** until
    `cover` reaches 24 of 26.
 

@@ -7,7 +7,7 @@
 //! 1. Rest it with that face up. Holding still long enough records the
 //!    accelerometer there and gives the hub the stationary spells its own
 //!    accelerometer and gyroscope calibration learn from.
-//! 2. Move it in a slow figure of eight for five seconds, which is what
+//! 2. Pick it up and slowly turn it every way for five seconds, which is what
 //!    spreads the magnetometer readings around.
 //!
 //! The readings are then topped up until they cover nearly every direction,
