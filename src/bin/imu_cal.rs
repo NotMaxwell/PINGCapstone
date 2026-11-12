@@ -321,10 +321,11 @@ mod cal {
         up: [f32; 3],
     ) -> [f32; 3] {
         rprintln!(
-            "Face {}/{}: {}, rest it there and hold still",
+            "Face {}/{}: {}, rest it there and hold still ({} readings kept so far)",
             number,
             FACES.len(),
-            name
+            name,
+            readings.samples().len()
         );
         let mut hold = Hold::new();
         let mut next_refresh = Instant::now();
@@ -563,12 +564,32 @@ mod cal {
         // Saved whatever the fit makes of the magnetometer: it is the hub's
         // accelerometer and gyroscope calibration, and it replaces whatever
         // was in flash.
-        let saved = imu.save_calibration().await;
+        let mut saved = imu.save_calibration().await;
         match &saved {
             Ok(()) => {
                 rprintln!("The IMU confirmed saving its accelerometer and gyroscope calibration.")
             }
-            Err(error) => rprintln!("Saving the hub's calibration failed: {:?}", error),
+            Err(error) => {
+                // The hub gives no reason for a refusal. One guess is that it
+                // will not save with its magnetometer calibration off, which
+                // this tests; the hub's magnetometer calibration is not used,
+                // so turning it on costs nothing.
+                rprintln!(
+                    "Saving the hub's calibration failed: {:?}. Trying again with the hub's own \
+                     magnetometer calibration on, to see whether that is why.",
+                    error
+                );
+                saved = match imu.configure_calibration(true, true, true).await {
+                    Ok(()) => imu.save_calibration().await,
+                    Err(error) => Err(error),
+                };
+                match &saved {
+                    Ok(()) => rprintln!(
+                        "That save was accepted, so the magnetometer setting is the likely reason."
+                    ),
+                    Err(error) => rprintln!("That save failed too: {:?}", error),
+                }
+            }
         }
 
         show(&mut lcd, &[format_args!("fitting...")]).await;
@@ -624,5 +645,17 @@ mod cal {
                 .await;
             }
         }
+
+        // Every kept reading, oldest first, so a failed fit can be looked
+        // into on the computer. It pauses every few lines so RTT's small
+        // buffer does not drop any.
+        rprintln!("---- readings, index,x,y,z uT, oldest first");
+        for (index, s) in readings.samples().iter().enumerate() {
+            rprintln!("{},{:.2},{:.2},{:.2}", index, s.x, s.y, s.z);
+            if index % 8 == 7 {
+                Timer::after(Duration::from_millis(20)).await;
+            }
+        }
+        rprintln!("---- end of readings");
     }
 }
