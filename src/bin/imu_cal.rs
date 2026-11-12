@@ -370,7 +370,11 @@ mod cal {
         number: usize,
         name: &str,
     ) {
-        rprintln!("Face {}/{}: slow figure of eight", number, FACES.len());
+        rprintln!(
+            "Face {}/{}: pick it up and slowly turn it to point every way you can",
+            number,
+            FACES.len()
+        );
         let end = Instant::now() + SWEEP;
         let mut next_refresh = Instant::now();
         while Instant::now() < end {
@@ -382,7 +386,7 @@ mod cal {
                     &[
                         format_args!("face {}/{}", number, FACES.len()),
                         format_args!("{}", name),
-                        format_args!("figure 8 {left} s"),
+                        format_args!("turn all ways {left}"),
                         format_args!("cover {}/{}", readings.covered(), SECTORS),
                     ],
                 )
