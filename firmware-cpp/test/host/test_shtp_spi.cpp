@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -10,327 +11,393 @@
 
 namespace {
 
-using ping::shtp::Error;
 using ping::shtp::SpiBus;
-using ping::shtp::SpiTransport;
+using ping::shtp::SpiHal;
 
-/// A BNO085 as seen from the bus: a stream of bytes it clocks out, an INT
-/// line, and a log of every pin change and transfer.
-class FakeBus final : public SpiBus {
+/// A BNO08x as the HAL sees it: cargos it wants to send, an INTN line it
+/// pulls with each one, and a log of every pin change and transfer.
+class FakeHub final : public SpiBus {
   public:
+    SpiHal* hal = nullptr;
     std::vector<std::string> log;
-    std::deque<std::uint8_t> miso;
-    std::vector<std::uint8_t> mosi;
-    bool int_low = false;
-    bool answers_wake = true;
+    std::deque<std::vector<std::uint8_t>> outgoing;
+    std::vector<std::vector<std::uint8_t>> received;
     bool boots = true;
+    bool answers_wake = true;
+    bool init_ok = true;
     bool fail_transfers = false;
-    bool cs_high = true;
-    std::uint32_t time_us = 0;
+    std::uint32_t now = 0;
 
-    void set_cs(bool high) override
+    bool init_hw() override
     {
-        cs_high = high;
-        log.emplace_back(high ? "cs+" : "cs-");
+        log.emplace_back("init");
+        return init_ok;
     }
-    void set_wake(bool high) override
-    {
-        log.emplace_back(high ? "wake+" : "wake-");
-        if (!high && answers_wake) {
-            int_low = true;
-        }
-    }
-    void set_reset(bool high) override
+    void deinit_hw() override { log.emplace_back("deinit"); }
+    void rstn(bool high) override
     {
         log.emplace_back(high ? "rst+" : "rst-");
         if (high && boots) {
-            int_low = true;
+            queue({0x10, 0x00, 0x00, 0x00, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
         }
     }
-    bool int_high() override { return !int_low; }
-    bool wait_int_low(std::uint32_t timeout_ms) override
+    void ps0_waken(bool high) override
     {
-        log.emplace_back("wait" + std::to_string(timeout_ms));
-        if (!int_low) {
-            time_us += timeout_ms * 1000;
+        log.emplace_back(high ? "wake+" : "wake-");
+        if (!high && answers_wake) {
+            edge();
         }
-        return int_low;
+    }
+    void csn(bool high) override
+    {
+        log.emplace_back(high ? "cs+" : "cs-");
+        cs_low_ = !high;
+        if (high && clocked_ > 0) {
+            if (!mosi_.empty() && (mosi_[0] | mosi_[1]) != 0) {
+                received.push_back(mosi_);
+            }
+            if (!outgoing.empty() && clocked_ >= kHeader) {
+                outgoing.pop_front();
+            }
+            clocked_ = 0;
+            mosi_.clear();
+            if (!outgoing.empty()) {
+                edge();
+            }
+        }
     }
     bool transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t len) override
     {
         log.emplace_back("xfer" + std::to_string(len));
-        EXPECT_FALSE(cs_high) << "transfer with CS high";
         if (fail_transfers) {
             return false;
         }
+        if (!cs_low_) {
+            return true; // the dummy clock-settling transfer
+        }
         for (std::size_t n = 0; n < len; ++n) {
-            mosi.push_back(tx != nullptr ? tx[n] : 0);
-            std::uint8_t byte = 0;
-            if (!miso.empty()) {
-                byte = miso.front();
-                miso.pop_front();
-            }
-            if (rx != nullptr) {
-                rx[n] = byte;
-            }
+            mosi_.push_back(tx[n]);
+            const auto& cargo = outgoing.empty() ? kNothing : outgoing.front();
+            rx[n] = clocked_ < cargo.size() ? cargo[clocked_] : 0;
+            ++clocked_;
         }
         return true;
     }
-    void delay_ms(std::uint32_t ms) override
+    void enable_ints() override
     {
-        log.emplace_back("delay" + std::to_string(ms));
-        time_us += ms * 1000;
-    }
-    std::uint32_t now_us() override { return time_us; }
-
-    /// Queues a cargo of `len` bytes on `channel`, payload bytes counting up.
-    void queue_cargo(std::uint16_t len, std::uint8_t channel)
-    {
-        miso.push_back(static_cast<std::uint8_t>(len & 0xFF));
-        miso.push_back(static_cast<std::uint8_t>(len >> 8));
-        miso.push_back(channel);
-        miso.push_back(7);
-        for (std::size_t n = 4; n < len; ++n) {
-            miso.push_back(static_cast<std::uint8_t>(n));
+        log.emplace_back("ints+");
+        ints_ = true;
+        if (pending_) {
+            pending_ = false;
+            edge();
         }
     }
+    void disable_ints() override
+    {
+        log.emplace_back("ints-");
+        ints_ = false;
+    }
+    void wait_int(std::uint32_t timeout_us) override
+    {
+        if (fired_) {
+            fired_ = false;
+            return;
+        }
+        now += timeout_us;
+    }
+    void delay_us(std::uint32_t us) override
+    {
+        log.emplace_back("delay" + std::to_string(us));
+        now += us;
+    }
+    std::uint32_t time_now_us() override { return now; }
+
+    /// Queues a cargo and, if the bus is free, pulls INTN.
+    void queue(std::vector<std::uint8_t> cargo)
+    {
+        outgoing.push_back(std::move(cargo));
+        if (outgoing.size() == 1 && !cs_low_) {
+            edge();
+        }
+    }
+
+  private:
+    static constexpr std::size_t kHeader = 4;
+    inline static const std::vector<std::uint8_t> kNothing{};
+
+    void edge()
+    {
+        if (!ints_) {
+            pending_ = true;
+            return;
+        }
+        hal->on_intn(now);
+        fired_ = true;
+    }
+
+    bool cs_low_ = false;
+    bool ints_ = false;
+    bool pending_ = false;
+    bool fired_ = false;
+    std::size_t clocked_ = 0;
+    std::vector<std::uint8_t> mosi_;
 };
 
-const std::array<std::uint8_t, 6> kFrame{6, 0, 2, 0, 0xF9, 0};
+struct Rig {
+    FakeHub hub;
+    SpiHal hal{hub};
+    Rig() { hub.hal = &hal; }
+};
 
-TEST(ShtpSpi, ParseHeaderRejectsEmptyAndIdleBus)
+std::vector<std::uint8_t> cargo(std::uint16_t len, std::uint8_t channel)
 {
-    ping::shtp::Header header{};
-    const std::array<std::uint8_t, 4> zeros{0, 0, 0, 0};
-    const std::array<std::uint8_t, 4> ones{0xFF, 0xFF, 0xFF, 0xFF};
-    const std::array<std::uint8_t, 4> bare{4, 0, 1, 0};
-    const std::array<std::uint8_t, 4> cont{0x10, 0x81, 3, 9};
-    EXPECT_FALSE(ping::shtp::parse_header(zeros, header));
-    EXPECT_FALSE(ping::shtp::parse_header(ones, header));
-    EXPECT_FALSE(ping::shtp::parse_header(bare, header));
-    ASSERT_TRUE(ping::shtp::parse_header(cont, header));
-    EXPECT_EQ(header.cargo_len, 0x110);
-    EXPECT_TRUE(header.continuation);
-    EXPECT_EQ(header.channel, 3);
-    EXPECT_EQ(header.sequence, 9);
+    std::vector<std::uint8_t> out{static_cast<std::uint8_t>(len & 0xFF), static_cast<std::uint8_t>(len >> 8),
+                                  channel, 0};
+    for (std::size_t n = 4; n < len; ++n) {
+        out.push_back(static_cast<std::uint8_t>(n));
+    }
+    return out;
 }
 
-TEST(ShtpSpi, WriteWakesHubFirst)
+const std::vector<std::uint8_t> kCommand{6, 0, 2, 0, 0xF9, 0};
+
+TEST(SpiHal, OpenFollowsCevaResetSequence)
 {
-    FakeBus bus;
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
-    const std::vector<std::string> expected{"wake-", "wait50", "wake+", "cs-", "xfer6", "cs+"};
-    EXPECT_EQ(bus.log, expected);
-    EXPECT_EQ(bus.mosi, std::vector<std::uint8_t>(kFrame.begin(), kFrame.end()));
-    EXPECT_FALSE(transport.has_stash());
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    const std::vector<std::string> expected{"init", "rst-",  "cs+",  "xfer1", "delay10000",
+                                            "wake+", "rst+", "ints+"};
+    EXPECT_EQ(rig.hub.log, expected);
+    EXPECT_FALSE(rig.hal.in_reset());
+    EXPECT_EQ(rig.hub.now, 10'000U);
 }
 
-TEST(ShtpSpi, WriteTimesOutCleanly)
+TEST(SpiHal, OpenWaitsStartDelayForAHubThatDoesNotBoot)
 {
-    FakeBus bus;
-    bus.answers_wake = false;
-    SpiTransport transport(bus);
-    const auto result = transport.write(kFrame);
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error().kind, Error::Kind::kTimeout);
-    const std::vector<std::string> expected{"wake-", "wait50", "wake+"};
-    EXPECT_EQ(bus.log, expected);
-    EXPECT_TRUE(bus.mosi.empty());
-    EXPECT_TRUE(bus.cs_high);
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    EXPECT_TRUE(rig.hal.in_reset());
+    EXPECT_EQ(rig.hub.now, 10'000U + ping::shtp::kStartDelayUs);
 }
 
-TEST(ShtpSpi, WriteRejectsBadLengths)
+TEST(SpiHal, OpenFailsWhenThePlatformRefuses)
 {
-    FakeBus bus;
-    SpiTransport transport(bus);
-    const std::array<std::uint8_t, 3> short_frame{3, 0, 0};
-    std::array<std::uint8_t, ping::shtp::kMaxWrite + 1> long_frame{};
-    EXPECT_EQ(transport.write(short_frame).error().kind, Error::Kind::kBadLength);
-    EXPECT_EQ(transport.write(long_frame).error().kind, Error::Kind::kBadLength);
-    EXPECT_TRUE(bus.log.empty());
+    Rig rig;
+    rig.hub.init_ok = false;
+    EXPECT_EQ(rig.hal.open(), ping::shtp::kSh2ErrIo);
+    EXPECT_FALSE(rig.hal.is_open());
 }
 
-TEST(ShtpSpi, ReadWithIntHighReturnsNothing)
+TEST(SpiHal, SecondOpenIsRefused)
 {
-    FakeBus bus;
-    bus.queue_cargo(10, 3);
-    SpiTransport transport(bus);
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    EXPECT_EQ(rig.hal.open(), ping::shtp::kSh2Err);
+}
+
+TEST(SpiHal, ReadsHeaderThenBodyOnIntn)
+{
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.log.clear();
+    rig.hub.now = 12'345;
+
+    std::array<std::uint8_t, 1024> buf{};
+    std::uint32_t t = 0;
+    const int len = rig.hal.read(buf.data(), buf.size(), &t);
+    ASSERT_EQ(len, 16);
+    EXPECT_EQ(buf[4], 1);
+    EXPECT_EQ(buf[15], 12);
+    // Stamped when INTN was seen (as interrupts came on), not when read.
+    EXPECT_EQ(t, 10'000U);
+    const std::vector<std::string> expected{"cs-", "xfer4", "xfer12", "cs+"};
+    EXPECT_EQ(rig.hub.log, expected);
+}
+
+TEST(SpiHal, ReadWithoutIntnReturnsNothing)
+{
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.log.clear();
     std::array<std::uint8_t, 64> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_TRUE(result);
-    EXPECT_EQ(*result, 0U);
-    EXPECT_TRUE(bus.log.empty());
-
-    const auto waited = transport.read(buf, 5);
-    ASSERT_TRUE(waited);
-    EXPECT_EQ(*waited, 0U);
-    const std::vector<std::string> expected{"wait5"};
-    EXPECT_EQ(bus.log, expected);
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
+    EXPECT_TRUE(rig.hub.log.empty());
 }
 
-TEST(ShtpSpi, ReadsHeaderThenBody)
+TEST(SpiHal, ReadWaitsForIntnWhenAsked)
 {
-    FakeBus bus;
-    bus.int_low = true;
-    bus.queue_cargo(10, 3);
-    SpiTransport transport(bus);
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hal.set_read_wait_us(5'000);
+    const std::uint32_t before = rig.hub.now;
     std::array<std::uint8_t, 64> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_TRUE(result);
-    ASSERT_EQ(*result, 10U);
-    const std::vector<std::string> expected{"cs-", "xfer4", "xfer6", "cs+"};
-    EXPECT_EQ(bus.log, expected);
-    EXPECT_EQ(buf[0], 10);
-    EXPECT_EQ(buf[2], 3);
-    EXPECT_EQ(buf[4], 4);
-    EXPECT_EQ(buf[9], 9);
-    EXPECT_TRUE(bus.miso.empty());
-    // Reading sends zeros, which the hub takes as an empty cargo.
-    EXPECT_EQ(bus.mosi, std::vector<std::uint8_t>(10, 0));
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
+    EXPECT_EQ(rig.hub.now - before, 5'000U);
 }
 
-TEST(ShtpSpi, ReadOfEmptyHeaderStops)
+TEST(SpiHal, EmptyHeaderEndsTheTransfer)
 {
-    FakeBus bus;
-    bus.int_low = true;
-    SpiTransport transport(bus);
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hal.on_intn(0); // spurious INTN, the hub sends zeros
+    rig.hub.log.clear();
     std::array<std::uint8_t, 64> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_TRUE(result);
-    EXPECT_EQ(*result, 0U);
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
     const std::vector<std::string> expected{"cs-", "xfer4", "cs+"};
-    EXPECT_EQ(bus.log, expected);
+    EXPECT_EQ(rig.hub.log, expected);
 }
 
-TEST(ShtpSpi, CargoClockedInDuringWriteIsReturnedByNextRead)
+TEST(SpiHal, WriteAssertsWakeAndSendsOnIntn)
 {
-    FakeBus bus;
-    bus.queue_cargo(20, 3);
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
-    const std::vector<std::string> expected{"wake-", "wait50", "wake+", "cs-", "xfer6", "xfer14", "cs+"};
-    EXPECT_EQ(bus.log, expected);
-    EXPECT_TRUE(transport.has_stash());
-    EXPECT_TRUE(bus.miso.empty());
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.log.clear();
 
-    bus.log.clear();
-    bus.int_low = false;
+    ASSERT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
+    const std::vector<std::string> after_write{"wake-"};
+    EXPECT_EQ(rig.hub.log, after_write) << "nothing is clocked until the hub answers";
+
     std::array<std::uint8_t, 64> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_TRUE(result);
-    ASSERT_EQ(*result, 20U);
-    EXPECT_TRUE(bus.log.empty()) << "the stash is served without touching the bus";
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
+    const std::vector<std::string> expected{"wake-", "cs-", "wake+", "xfer6", "cs+"};
+    EXPECT_EQ(rig.hub.log, expected);
+    ASSERT_EQ(rig.hub.received.size(), 1U);
+    EXPECT_EQ(rig.hub.received[0], kCommand);
+}
+
+TEST(SpiHal, CargoClockedInDuringWriteIsDeliveredTruncated)
+{
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.queue(cargo(20, 3));
+    std::array<std::uint8_t, 64> buf{};
+    std::uint32_t t = 0;
+    // CEVA's read is the full cargo here, so drain it, then queue one that
+    // will meet the write.
+    ASSERT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 20);
+
+    ASSERT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
+    rig.hub.queue(cargo(20, 3));
+    // The write met the queued cargo: only as many bytes as were written
+    // come back, as in CEVA's SPI_WRITE completion.
+    const int len = rig.hal.read(buf.data(), buf.size(), &t);
+    EXPECT_EQ(len, 6);
     EXPECT_EQ(buf[0], 20);
-    EXPECT_EQ(buf[5], 5);
-    EXPECT_EQ(buf[19], 19);
-    EXPECT_FALSE(transport.has_stash());
+    EXPECT_EQ(buf[2], 3);
 }
 
-TEST(ShtpSpi, ShortCargoDuringWriteIsStashedWhole)
+TEST(SpiHal, SecondWriteWaitsForTheFirst)
 {
-    FakeBus bus;
-    bus.queue_cargo(5, 1);
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
+    Rig rig;
+    rig.hub.boots = false;
+    rig.hub.answers_wake = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    ASSERT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
+    EXPECT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 0);
+}
+
+TEST(SpiHal, WriteGivesUpWhenHubNeverAnswersWake)
+{
+    Rig rig;
+    rig.hub.boots = false;
+    rig.hub.answers_wake = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    ASSERT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
+    rig.hub.log.clear();
+    rig.hub.now += ping::shtp::kWakeTimeoutUs;
+    EXPECT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), ping::shtp::kSh2ErrTimeout);
+    const std::vector<std::string> expected{"wake+"};
+    EXPECT_EQ(rig.hub.log, expected);
+    EXPECT_EQ(rig.hal.take_wake_timeouts(), 1U);
+    // The next write starts afresh.
+    EXPECT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
+}
+
+TEST(SpiHal, WriteRejectsOversizedFrames)
+{
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    std::array<std::uint8_t, ping::shtp::kMaxTransferOut + 1> big{};
+    EXPECT_EQ(rig.hal.write(big.data(), big.size()), ping::shtp::kSh2ErrBadParam);
+}
+
+TEST(SpiHal, TooSmallBufferDiscardsTheCargo)
+{
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    std::array<std::uint8_t, 8> buf{};
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), ping::shtp::kSh2ErrBadParam);
+    std::array<std::uint8_t, 64> big{};
+    EXPECT_EQ(rig.hal.read(big.data(), big.size(), &t), 0);
+}
+
+TEST(SpiHal, OversizedLengthIsTruncatedToTheBuffer)
+{
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.queue(cargo(2000, 3));
+    std::array<std::uint8_t, 1024> buf{};
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 1024);
+}
+
+TEST(SpiHal, BusFailureIsCountedAndRecovered)
+{
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.fail_transfers = true;
     std::array<std::uint8_t, 64> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_TRUE(result);
-    EXPECT_EQ(*result, 5U);
-    EXPECT_EQ(buf[2], 1);
-    EXPECT_EQ(buf[4], 4);
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
+    EXPECT_EQ(rig.hal.take_bus_errors(), 1U);
+    EXPECT_EQ(rig.hub.log.back(), "cs+");
+
+    rig.hub.fail_transfers = false;
+    rig.hal.on_intn(0);
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 16);
 }
 
-TEST(ShtpSpi, OversizedCargoIsDiscardedAndReported)
+TEST(SpiHal, DeadlineAbortsWithAResetCompleteCargo)
 {
-    FakeBus bus;
-    bus.int_low = true;
-    bus.queue_cargo(100, 3);
-    bus.queue_cargo(8, 3);
-    SpiTransport transport(bus);
-    std::array<std::uint8_t, 32> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error().kind, Error::Kind::kCargoTooLarge);
-    EXPECT_EQ(result.error().cargo_len, 100);
-    const std::vector<std::string> expected{"cs-", "xfer4", "xfer96", "cs+"};
-    EXPECT_EQ(bus.log, expected);
-
-    // The bus is still in step: the next cargo reads normally.
-    const auto next = transport.read(buf);
-    ASSERT_TRUE(next);
-    EXPECT_EQ(*next, 8U);
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hal.arm_deadline(1'000);
+    std::array<std::uint8_t, 64> buf{};
+    std::uint32_t t = 0;
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
+    EXPECT_FALSE(rig.hal.aborted());
+    rig.hub.now += 1'000;
+    ASSERT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 5);
+    EXPECT_TRUE(rig.hal.aborted());
+    const std::array<std::uint8_t, 5> expected{5, 0, 1, 0, 1};
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), buf.begin()));
+    rig.hal.disarm_deadline();
+    EXPECT_FALSE(rig.hal.aborted());
 }
 
-TEST(ShtpSpi, OversizedCargoDuringWriteIsDiscarded)
+TEST(SpiHal, CloseHoldsHubInReset)
 {
-    FakeBus bus;
-    bus.queue_cargo(static_cast<std::uint16_t>(ping::shtp::kMaxCargo + 10), 0);
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
-    EXPECT_FALSE(transport.has_stash());
-    EXPECT_TRUE(bus.miso.empty());
-}
-
-TEST(ShtpSpi, StashTooLargeForBufferIsReported)
-{
-    FakeBus bus;
-    bus.queue_cargo(40, 3);
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
-    std::array<std::uint8_t, 16> buf{};
-    const auto result = transport.read(buf);
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error().kind, Error::Kind::kCargoTooLarge);
-    EXPECT_FALSE(transport.has_stash());
-}
-
-TEST(ShtpSpi, BusFailureReleasesChipSelect)
-{
-    FakeBus bus;
-    bus.int_low = true;
-    bus.fail_transfers = true;
-    SpiTransport transport(bus);
-    std::array<std::uint8_t, 32> buf{};
-    const auto read = transport.read(buf);
-    ASSERT_FALSE(read);
-    EXPECT_EQ(read.error().kind, Error::Kind::kBus);
-    EXPECT_TRUE(bus.cs_high);
-
-    const auto write = transport.write(kFrame);
-    ASSERT_FALSE(write);
-    EXPECT_EQ(write.error().kind, Error::Kind::kBus);
-    EXPECT_TRUE(bus.cs_high);
-}
-
-TEST(ShtpSpi, ResetSequence)
-{
-    FakeBus bus;
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.reset());
-    const std::vector<std::string> expected{"wake+", "cs+", "rst-", "delay10", "rst+", "wait500"};
-    EXPECT_EQ(bus.log, expected);
-}
-
-TEST(ShtpSpi, ResetTimesOutWhenHubDoesNotBoot)
-{
-    FakeBus bus;
-    bus.boots = false;
-    SpiTransport transport(bus);
-    const auto result = transport.reset();
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error().kind, Error::Kind::kTimeout);
-}
-
-TEST(ShtpSpi, ResetDropsStash)
-{
-    FakeBus bus;
-    bus.queue_cargo(20, 3);
-    SpiTransport transport(bus);
-    ASSERT_TRUE(transport.write(kFrame));
-    ASSERT_TRUE(transport.has_stash());
-    ASSERT_TRUE(transport.reset());
-    EXPECT_FALSE(transport.has_stash());
+    Rig rig;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.log.clear();
+    rig.hal.close();
+    const std::vector<std::string> expected{"ints-", "rst-", "cs+", "deinit"};
+    EXPECT_EQ(rig.hub.log, expected);
+    EXPECT_FALSE(rig.hal.is_open());
+    EXPECT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
 }
 
 } // namespace

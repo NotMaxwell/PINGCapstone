@@ -1,11 +1,11 @@
 /// @file
-/// The BNO085's bus on ESP-IDF, and the HAL CEVA's sh2 library runs on.
+/// CEVA's SPI HAL for sh2 (@ref ping/shtp_spi.hpp) on ESP-IDF.
 ///
-/// @ref EspSpiBus implements @ref ping::shtp::SpiBus with the `spi_master`
-/// driver (no hardware CS, mode 3) and GPIOs for CS, WAKE and RST; INT falling
-/// edges give a binary semaphore, so waiting for the hub blocks the task
-/// instead of polling. @ref Hal adapts @ref ping::shtp::SpiTransport to
-/// `sh2_Hal_t`.
+/// @ref EspSpiBus supplies what the STM32 HAL supplied to CEVA's code: the
+/// `spi_master` driver in mode 3 with chip select driven by hand
+/// (`spics_io_num = -1`), GPIOs for CSN, PS0/WAKE and RSTN, a GPIO interrupt
+/// on INTN's falling edge, and `esp_timer` for microseconds. @ref Hal wraps it
+/// all as the `sh2_Hal_t` that `sh2_open` takes.
 
 #pragma once
 
@@ -22,7 +22,6 @@ extern "C" {
 }
 
 #include <cstdint>
-#include <optional>
 
 namespace ping::bno085 {
 
@@ -40,51 +39,39 @@ struct Pins {
 
 class EspSpiBus final : public shtp::SpiBus {
   public:
-    explicit EspSpiBus(const Pins& pins) : pins_(pins) {}
-    ~EspSpiBus() override { deinit(); }
+    EspSpiBus(const Pins& pins, shtp::SpiHal& hal) : pins_(pins), hal_(hal) {}
+    ~EspSpiBus() override { deinit_hw(); }
 
-    /// Releases anything a previous call set up, then configures the pins,
-    /// the SPI bus and the INT interrupt from scratch.
-    esp_err_t init();
-    void deinit();
+    /// What ESP-IDF returned when @ref init_hw last failed, ESP_OK otherwise.
+    [[nodiscard]] esp_err_t init_error() const { return init_error_; }
 
-    void set_cs(bool high) override;
-    void set_wake(bool high) override;
-    void set_reset(bool high) override;
-    bool int_high() override;
-    bool wait_int_low(std::uint32_t timeout_ms) override;
+    bool init_hw() override;
+    void deinit_hw() override;
+    void rstn(bool high) override;
+    void ps0_waken(bool high) override;
+    void csn(bool high) override;
     bool transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t len) override;
-    void delay_ms(std::uint32_t ms) override;
-    std::uint32_t now_us() override;
+    void enable_ints() override;
+    void disable_ints() override;
+    void wait_int(std::uint32_t timeout_us) override;
+    void delay_us(std::uint32_t us) override;
+    std::uint32_t time_now_us() override;
 
   private:
-    static void on_int(void* arg);
+    static void on_intn(void* arg);
+    esp_err_t setup();
 
     Pins pins_;
+    shtp::SpiHal& hal_;
     spi_device_handle_t device_ = nullptr;
     bool bus_ready_ = false;
     bool isr_added_ = false;
-    SemaphoreHandle_t int_falling_ = nullptr;
-    StaticSemaphore_t int_falling_storage_{};
+    esp_err_t init_error_ = ESP_OK;
+    SemaphoreHandle_t intn_ = nullptr;
+    StaticSemaphore_t intn_storage_{};
 };
 
-/// What the HAL saw go wrong underneath sh2, which sh2 itself only reports as
-/// a generic status code (or not at all, for reads).
-struct HalError {
-    enum class Kind : std::uint8_t {
-        /// ESP-IDF refused to set up the bus or pins; see @ref esp.
-        kInit,
-        /// The hub did not pull INT low after a hardware reset.
-        kBootTimeout,
-        /// The hub did not answer WAKE before a write.
-        kWakeTimeout,
-        /// An SPI transfer failed.
-        kBus,
-    };
-    Kind kind;
-    esp_err_t esp = ESP_OK;
-};
-
+/// The `sh2_Hal_t` for one BNO08x.
 class Hal {
   public:
     explicit Hal(const Pins& pins);
@@ -93,30 +80,10 @@ class Hal {
 
     /// The table to hand to `sh2_open`.
     sh2_Hal_t* sh2() { return &glue_.hal; }
-
-    /// How long one sh2 read may block waiting for INT. sh2 polls in tight
-    /// loops; a short block here lets them sleep on the semaphore instead.
-    void set_read_wait_ms(std::uint32_t ms) { read_wait_ms_ = ms; }
-
-    /// Most sh2 operations wait for the hub's answer with no timeout at all.
-    /// Once an armed deadline passes, the next read hands sh2 a made-up
-    /// "reset complete" cargo, which is sh2's own way to abort an operation
-    /// (it then returns SH2_ERR); @ref aborted reports that it happened.
-    void arm_deadline(std::uint32_t timeout_ms);
-    void disarm_deadline()
-    {
-        deadline_armed_ = false;
-        aborted_ = false;
-    }
-    [[nodiscard]] bool aborted() const { return aborted_; }
-
-    /// The first error since the last call, if any.
-    std::optional<HalError> take_error();
-
-    /// Cargos too large for sh2's buffer, read and thrown away.
-    [[nodiscard]] std::uint32_t discarded_cargos() const { return discarded_; }
-
-    std::uint32_t now_us() { return bus_.now_us(); }
+    shtp::SpiHal& spi() { return spi_; }
+    [[nodiscard]] const shtp::SpiHal& spi() const { return spi_; }
+    [[nodiscard]] esp_err_t init_error() const { return bus_.init_error(); }
+    std::uint32_t now_us() { return spi_.get_time_us(); }
 
   private:
     // sh2 calls back with the sh2_Hal_t pointer it was given; `hal` being the
@@ -133,18 +100,9 @@ class Hal {
     static int write(sh2_Hal_t* hal, std::uint8_t* buffer, unsigned len);
     static std::uint32_t get_time_us(sh2_Hal_t* hal);
 
-    void record(HalError error);
-
+    shtp::SpiHal spi_;
     EspSpiBus bus_;
-    shtp::SpiTransport transport_;
     Glue glue_;
-    std::uint32_t read_wait_ms_ = 5;
-    bool deadline_armed_ = false;
-    bool aborted_ = false;
-    std::uint32_t deadline_start_us_ = 0;
-    std::uint32_t deadline_us_ = 0;
-    std::optional<HalError> error_;
-    std::uint32_t discarded_ = 0;
 };
 
 } // namespace ping::bno085
