@@ -32,9 +32,28 @@ between them never rebuilds the others.
 | CMake ≥ 3.25, Ninja | | Build |
 | clang + libc++ (host tests) | clang 18+; libc++ only needed before clang 19 | Host unit tests |
 
-### Installing ESP-IDF with the clang toolchain
+### Quick setup
 
-Linux and macOS (Windows: use the ESP-IDF installer, then the same `idf_tools.py` line):
+The setup scripts install everything below for your OS, and are safe to run again:
+
+```sh
+./setup.sh                    # Linux (apt, dnf, pacman, zypper) or macOS (Homebrew)
+./setup.sh --no-system        # without sudo: ESP-IDF only, system packages are up to you
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1    # Windows, no administrator rights needed
+```
+
+On Linux the script also installs OpenOCD's udev rule and adds you to the
+serial-port groups (log out and in afterwards). On Windows it installs Git and
+Python with `winget --scope user` if they are missing, and llvm-mingw for the
+host tests. If your organisation blocks programs in your user folder, it says
+so at the end; see "On a locked-down PC" below.
+
+### Installing by hand
+
+Linux and macOS (Windows: `install.ps1` instead of `install.sh`):
 
 ```sh
 mkdir -p ~/esp && cd ~/esp
