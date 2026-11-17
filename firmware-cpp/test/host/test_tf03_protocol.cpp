@@ -153,3 +153,31 @@ TEST(Tf03Protocol, ResetForgetsAPartialPacket)
     EXPECT_TRUE(feed(parser, std::vector<std::uint8_t>(frame.begin() + 5, frame.end())).empty());
     EXPECT_EQ(feed(parser, frame).size(), 1U);
 }
+
+TEST(Tf03Protocol, CountsBytesPacketsAndSkippedGarbage)
+{
+    std::vector<std::uint8_t> bytes{0x00, 0x13};
+    const auto frame = data_frame(100, 200);
+    bytes.insert(bytes.end(), frame.begin(), frame.end());
+
+    Parser parser;
+    feed(parser, bytes);
+    EXPECT_EQ(parser.counts().bytes, bytes.size());
+    EXPECT_EQ(parser.counts().packets, 1U);
+    EXPECT_EQ(parser.counts().skipped, 2U);
+    EXPECT_EQ(parser.counts().checksum_errors, 0U);
+}
+
+TEST(Tf03Protocol, CountsAChecksumErrorForACorruptedFrame)
+{
+    auto corrupted = data_frame(100, 200);
+    corrupted[3] ^= 0x01;
+    auto bytes = corrupted;
+    const auto good = data_frame(300, 400);
+    bytes.insert(bytes.end(), good.begin(), good.end());
+
+    Parser parser;
+    feed(parser, bytes);
+    EXPECT_EQ(parser.counts().packets, 1U);
+    EXPECT_GE(parser.counts().checksum_errors, 1U);
+}

@@ -37,6 +37,8 @@
 
 #include <driver/gpio.h>
 #include <driver/uart.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <esp_err.h>
 
 #include <array>
@@ -130,6 +132,27 @@ struct FirmwareVersion {
     std::uint8_t patch;
 };
 
+/// Everything seen on the LiDAR's wire since @ref Tf03::begin. When the TF03
+/// "stops communicating", these say where: no new bytes means the sensor,
+/// its power or its wiring; bytes without packets means framing (baud rate,
+/// noise) or this parser; frame errors mean the line itself.
+struct LinkStats {
+    /// Parser counts: bytes, packets, checksum errors, skipped bytes.
+    Parser::Counts parser;
+    /// UART hardware events reported by the ESP-IDF driver.
+    std::uint32_t fifo_overflows = 0;
+    std::uint32_t buffer_full = 0;
+    std::uint32_t frame_errors = 0;
+    std::uint32_t parity_errors = 0;
+    std::uint32_t breaks = 0;
+    /// Times the UART driver was torn down and installed again.
+    std::uint32_t uart_restarts = 0;
+    /// esp_timer time of the last byte and the last data frame, µs; 0 if
+    /// none yet.
+    std::int64_t last_byte_us = 0;
+    std::int64_t last_frame_us = 0;
+};
+
 /// A TF03 on one of the ESP32's UARTs.
 class Tf03 {
   public:
@@ -138,6 +161,13 @@ class Tf03 {
     /// Installs the ESP-IDF UART driver on the port and routes it to the
     /// given pins, 8N1 at `baud`. Nothing is sent.
     esp_err_t begin(gpio_num_t tx, gpio_num_t rx, int baud);
+
+    /// Deletes and reinstalls the UART driver with the settings @ref begin
+    /// was given, so a silent link can be told apart from a stuck ESP32
+    /// peripheral. Counts are kept.
+    esp_err_t restart_uart();
+
+    [[nodiscard]] const LinkStats& stats();
 
     /// Tells the driver about an out-of-range threshold configured on the
     /// TF03 earlier, so readings at that distance are reported as nothing.
@@ -200,7 +230,17 @@ class Tf03 {
     std::expected<void, Error> send(const Command& command);
     [[nodiscard]] Measurement measurement(const DataFrame& frame) const;
 
+    esp_err_t install();
+    /// Takes every pending UART event off the queue, counting them and
+    /// clearing an overflowed buffer.
+    void drain_events();
+
     uart_port_t port_;
+    gpio_num_t tx_ = GPIO_NUM_NC;
+    gpio_num_t rx_ = GPIO_NUM_NC;
+    int baud_ = 0;
+    QueueHandle_t events_ = nullptr;
+    LinkStats stats_;
     Parser parser_;
     std::array<std::uint8_t, 64> rx_buf_{};
     std::size_t rx_start_ = 0;

@@ -39,6 +39,7 @@
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #include <cinttypes>
 #include <cmath>
@@ -444,12 +445,44 @@ void lidar_task(void* /*arg*/)
                  tf03::to_string(version.error()));
     }
 
+    std::uint32_t silent_periods = 0;
     for (;;) {
         watchdog.feed();
-        if (auto measurement = lidar.read(kLidarSilenceMs)) {
+        auto measurement = lidar.read(kLidarSilenceMs);
+        if (measurement) {
+            if (silent_periods > 0) {
+                ESP_LOGI(kTag, "TF03 back after %" PRIu32 " silent periods", silent_periods);
+                silent_periods = 0;
+            }
             g_lidar.set(*measurement);
-        } else {
-            ESP_LOGW(kTag, "TF03 read failed: %s", tf03::to_string(measurement.error()));
+            continue;
+        }
+        ESP_LOGW(kTag, "TF03 read failed: %s", tf03::to_string(measurement.error()));
+        if (measurement.error().kind != tf03::Error::Kind::kTimeout) {
+            continue;
+        }
+
+        // Say exactly what the wire did, so a dropout can be pinned on the
+        // sensor (no bytes), the line (frame errors) or the parser (bytes
+        // but no packets).
+        ++silent_periods;
+        const tf03::LinkStats& s = lidar.stats();
+        const std::int64_t now = esp_timer_get_time();
+        ESP_LOGW(kTag,
+                 "TF03 link: %" PRIu32 " bytes, %" PRIu32 " packets, %" PRIu32 " bad checksums, %" PRIu32
+                 " skipped, %" PRIu32 " frame errs, %" PRIu32 " FIFO ovf, %" PRIu32 " buf full, last byte %" PRId64
+                 " ms ago, last frame %" PRId64 " ms ago",
+                 s.parser.bytes, s.parser.packets, s.parser.checksum_errors, s.parser.skipped, s.frame_errors,
+                 s.fifo_overflows, s.buffer_full, s.last_byte_us ? (now - s.last_byte_us) / 1000 : -1,
+                 s.last_frame_us ? (now - s.last_frame_us) / 1000 : -1);
+        // Rule out the ESP32's own UART: after a few silent periods, start
+        // its driver from scratch.
+        if (silent_periods % 3 == 0) {
+            if (esp_err_t err = lidar.restart_uart(); err != ESP_OK) {
+                ESP_LOGE(kTag, "TF03 UART restart failed: %s", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(kTag, "TF03 UART restarted");
+            }
         }
     }
 }

@@ -59,10 +59,12 @@ std::optional<Packet> Parser::push(std::uint8_t byte)
     // than the packet it starts with, and no packet is longer than the
     // buffer.
     buf_[len_++] = byte;
+    ++counts_.bytes;
 
     for (;;) {
         while (len_ > 0 && !plausible_start()) {
             consume(1);
+            ++counts_.skipped;
         }
 
         const auto needed = expected_len();
@@ -74,12 +76,15 @@ std::optional<Packet> Parser::push(std::uint8_t byte)
         if (checksum(candidate.first(*needed - 1)) == candidate.back()) {
             Packet packet = decode(candidate);
             consume(*needed);
+            ++counts_.packets;
             return packet;
         }
 
         // A false header, or a corrupted packet. A real one may begin
         // anywhere after its first byte.
         consume(1);
+        ++counts_.checksum_errors;
+        ++counts_.skipped;
     }
 }
 
