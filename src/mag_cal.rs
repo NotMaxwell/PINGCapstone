@@ -249,6 +249,28 @@ impl Collector {
         self.len == CAPACITY
     }
 
+    /// Keeps only the readings `keep` accepts, in order.
+    pub fn retain(&mut self, mut keep: impl FnMut(Vec3) -> bool) {
+        let mut kept = 0;
+        let mut index = 0;
+        self.min = [f32::MAX; 3];
+        self.max = [f32::MIN; 3];
+        while index < self.len {
+            let s = self.samples[index];
+            index += 1;
+            if !keep(s) {
+                continue;
+            }
+            self.samples[kept] = s;
+            kept += 1;
+            for (axis, value) in [s.x, s.y, s.z].into_iter().enumerate() {
+                self.min[axis] = self.min[axis].min(value);
+                self.max[axis] = self.max[axis].max(value);
+            }
+        }
+        self.len = kept;
+    }
+
     /// How many [`SECTORS`] are covered so far, judged from the middle of
     /// the range seen on each axis: good enough to steer the operator before
     /// there is a fit to measure from.
