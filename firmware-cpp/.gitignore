@@ -1,8 +1,11 @@
 # Every preset's build directory, including the host tests.
 build/
-# Fetched by the component manager from components/ping/idf_component.yml;
-# dependencies.lock pins what was fetched and is committed.
+# Fetched by the component manager from components/ping/idf_component.yml.
 managed_components/
+# Not committed: it records a content hash that differs between component
+# manager versions (local vs. Espressif's CI image), which fails the build.
+# idf_component.yml already pins u8g2 to a tag, i.e. a fixed commit.
+dependencies.lock
 # Each preset writes its own sdkconfig into its build directory; these appear
 # only when idf.py runs without a preset.
 sdkconfig

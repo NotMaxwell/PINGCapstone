@@ -88,8 +88,9 @@ idf.py --preset imu_demo build            # a demo
 idf.py --preset main-gcc build            # same program with GCC
 ```
 
-The first build fetches u8g2 (the only library not in this repository) into
-`managed_components/` and writes `dependencies.lock`; commit that file.
+The first build fetches u8g2 (the only library not in this repository, pinned
+to its 2.37.1 tag) into `managed_components/`. The `dependencies.lock` it writes
+is not committed: its content hash differs between component manager versions.
 
 ## Flash and monitor
 

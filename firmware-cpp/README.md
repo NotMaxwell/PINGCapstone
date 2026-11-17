@@ -27,7 +27,7 @@ wiring or the code. Every error is reported and recovered from at runtime.
 | Target geometry | none | `geo.cpp`, ported from `src/geo.rs` |
 
 u8g2 is the only library fetched at build time (pinned in
-`components/ping/idf_component.yml`, locked in `dependencies.lock`).
+`components/ping/idf_component.yml` to the 2.37.1 tag).
 
 What changed from the previous version of this port, which used the
 esp32_BNO08x wrapper and SparkFun's u-blox library:
