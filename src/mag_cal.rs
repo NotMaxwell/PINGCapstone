@@ -607,7 +607,7 @@ pub fn fit_hard_iron(samples: &[Vec3], matrix: [[f32; 3]; 3]) -> Result<HardIron
 /// deliberate sequence gives. What changes from one session to the next is
 /// the hard iron, though, and four unknowns can be found from the turning
 /// and tilting a device gets as it is carried about. Soft iron stays as
-/// `imu_cal` measured it, or uncorrected if it never has.
+/// `imu_cal` measured it.
 pub struct StartupCalibration {
     readings: Collector,
     matrix: [[f32; 3]; 3],
@@ -616,15 +616,15 @@ pub struct StartupCalibration {
 }
 
 impl StartupCalibration {
-    /// Starts collecting. `matrix` is the soft iron correction to keep;
-    /// `None` leaves the field as the hub reports it.
-    pub const fn new(matrix: Option<[[f32; 3]; 3]>) -> Self {
+    /// Starts collecting. `matrix` is the soft iron correction `imu_cal`
+    /// measured, which this keeps. There is deliberately no way to run
+    /// without one: a sphere fitted to part of a stretched ellipsoid can
+    /// pass every check and still be badly wrong, and soft iron near the IMU
+    /// can stretch it by half.
+    pub const fn new(matrix: [[f32; 3]; 3]) -> Self {
         Self {
             readings: Collector::new(),
-            matrix: match matrix {
-                Some(matrix) => matrix,
-                None => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            },
+            matrix,
             next_attempt: MIN_STARTUP_SAMPLES,
             done: false,
         }

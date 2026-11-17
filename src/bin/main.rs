@@ -575,7 +575,8 @@ mod sensors {
 
             // The game rotation vector's frame starts over with the hub.
             let mut compass = Compass::new(MAG_CALIBRATION);
-            let mut startup = StartupCalibration::new(MAG_CALIBRATION.map(|c| c.matrix));
+            // Only with imu_cal's soft iron correction to build on.
+            let mut startup = MAG_CALIBRATION.map(|c| StartupCalibration::new(c.matrix));
             let mut next_log = Instant::now();
             'reporting: loop {
                 match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {
@@ -595,7 +596,7 @@ mod sensors {
                         Ok(Some(event)) => match event.data {
                             SensorData::MagneticFieldUncalibrated { field, .. } => {
                                 compass.update_field(field);
-                                if let Some(found) = startup.add(field) {
+                                if let Some(found) = startup.as_mut().and_then(|s| s.add(field)) {
                                     rprintln!(
                                         "Compass calibrated from handling: hard iron {:.1} {:.1} {:.1} uT, field {:.1} uT, residual {:.4}",
                                         found.offset[0],
