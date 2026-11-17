@@ -576,7 +576,7 @@ mod sensors {
             // The game rotation vector's frame starts over with the hub.
             let mut compass = Compass::new(MAG_CALIBRATION);
             // Only with imu_cal's soft iron correction to build on.
-            let mut startup = MAG_CALIBRATION.map(|c| StartupCalibration::new(c.matrix));
+            let mut startup = MAG_CALIBRATION.map(StartupCalibration::new);
             let mut next_log = Instant::now();
             'reporting: loop {
                 match with_timeout(IMU_SILENCE, imu.wait_for_data()).await {

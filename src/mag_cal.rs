@@ -28,7 +28,7 @@
 use libm::{atan2f, atanf, cbrt, cosf, sinf, sqrt, sqrtf};
 
 use crate::bno085::{Accuracy, Quaternion, Vec3};
-use crate::constants::{EXPECTED_DIP_DEG, EXPECTED_FIELD_UT};
+use crate::constants::EXPECTED_DIP_DEG;
 
 /// How many readings [`Collector`] keeps.
 pub const CAPACITY: usize = 512;
@@ -94,6 +94,11 @@ const MIN_STARTUP_SPREAD_UT: f32 = 7.0;
 /// leaves soft iron uncorrected can pass the looser limit and still be
 /// several degrees out. Clean fits come in around a third of this.
 const MAX_STARTUP_RESIDUAL: f32 = 0.015;
+
+/// How much worse than `imu_cal`'s residual [`StartupCalibration`] will
+/// accept, as a factor, for a place noisier than [`MAX_STARTUP_RESIDUAL`]
+/// allows.
+const STARTUP_RESIDUAL_ROOM: f32 = 1.25;
 
 /// How many newly kept readings to wait for between attempts at a fit.
 const STARTUP_RETRY_READINGS: usize = 10;
@@ -646,21 +651,23 @@ pub fn fit_hard_iron(samples: &[Vec3], matrix: [[f32; 3]; 3]) -> Result<HardIron
 /// `imu_cal` measured it.
 pub struct StartupCalibration {
     readings: Collector,
-    matrix: [[f32; 3]; 3],
+    /// What `imu_cal` measured: its soft iron is kept, and its field
+    /// strength and residual are what a fit here is judged against.
+    reference: MagCalibration,
     next_attempt: usize,
     done: bool,
 }
 
 impl StartupCalibration {
-    /// Starts collecting. `matrix` is the soft iron correction `imu_cal`
-    /// measured, which this keeps. There is deliberately no way to run
-    /// without one: a sphere fitted to part of a stretched ellipsoid can
+    /// Starts collecting. `reference` is what `imu_cal` measured; its soft
+    /// iron correction is kept. There is deliberately no way to run without
+    /// one: a sphere fitted to part of a stretched ellipsoid can
     /// pass every check and still be badly wrong, and soft iron near the IMU
     /// can stretch it by half.
-    pub const fn new(matrix: [[f32; 3]; 3]) -> Self {
+    pub const fn new(reference: MagCalibration) -> Self {
         Self {
             readings: Collector::new(),
-            matrix,
+            reference,
             next_attempt: MIN_STARTUP_SAMPLES,
             done: false,
         }
@@ -678,12 +685,17 @@ impl StartupCalibration {
         }
         self.next_attempt = samples.len() + STARTUP_RETRY_READINGS;
 
-        let found = fit_hard_iron(samples, self.matrix).ok()?;
+        let reference = self.reference;
+        let found = fit_hard_iron(samples, reference.matrix).ok()?;
         let calibration = found.calibration;
+        // No worse than `imu_cal`'s own fit, with a little room, and the
+        // same field it saw. Comparing with Earth's field instead would
+        // refuse every fit indoors, where the field often reads stronger.
+        let residual_limit = (reference.residual * STARTUP_RESIDUAL_ROOM).max(MAX_STARTUP_RESIDUAL);
         let trusted = found.spread_ut >= MIN_STARTUP_SPREAD_UT
-            && calibration.residual <= MAX_STARTUP_RESIDUAL
-            && (calibration.field_ut - EXPECTED_FIELD_UT).abs()
-                <= FIELD_TOLERANCE * EXPECTED_FIELD_UT;
+            && calibration.residual <= residual_limit
+            && (calibration.field_ut - reference.field_ut).abs()
+                <= FIELD_TOLERANCE * reference.field_ut;
         if !trusted {
             return None;
         }
