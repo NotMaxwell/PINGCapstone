@@ -100,17 +100,23 @@ needs nothing but the display:
 3. After the sixth face, **tumble it slowly through every direction** until
    `cover` reaches 24 of 26.
 
-Then it fits an ellipsoid to the readings and prints the result over RTT. It
-is good if:
+Then it drops any readings far off the fit, fits again, and prints the result
+over RTT with an estimate of the heading error it leaves:
 
-- [ ] `sectors covered` is at least 24 of 26. Readings from one side alone can
-  fit with a tiny residual and still be wrong.
-- [ ] `residual` is under 0.03. Around 0.01 is normal.
-- [ ] `field strength` is within 20% of **48.8 µT**.
+| Result | When | What to do |
+|---|---|---|
+| `cal good` | residual under 0.03 (about 4°) and field within 20% of 48.8 µT | Paste the constant |
+| `cal ok, see RTT` | residual under 0.05 (about 6°), or the field far from 48.8 µT | Paste the constant; read the warning |
+| `cal failed` | fewer than 24 of 26 sectors covered, or residual over 0.05 | Run it again |
+
+A residual over 0.03 is usual indoors, where the field changes from spot to
+spot; a run outdoors cuts it. A field strength far from 48.8 µT does not change
+the heading, but the compass calls a field disturbed when it reads more than
+20% from what was calibrated, so calibrate where the device is used.
 
 Paste the printed `MAG_CALIBRATION` over the one in
-[`src/constants.rs`](../src/constants.rs). A failed run prints why and no
-constant; move away from whatever is near and press reset to go again.
+[`src/constants.rs`](../src/constants.rs). After a failed run, press reset to
+go again.
 
 The magnetometer correction lives in the firmware, because the hub has no way
 to accept one. The hub saves only its own accelerometer and gyroscope
