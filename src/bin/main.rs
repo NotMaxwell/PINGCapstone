@@ -723,7 +723,7 @@ mod display {
     use esp_hal::i2c::master::I2c;
     use ping_capstone::bno085::Accuracy;
     use ping_capstone::constants::{
-        LCD_REFRESH, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, TARGET_HOLD,
+        LCD_REFRESH, MAG_CALIBRATION, MAX_GPS_AGE, MAX_IMU_AGE, MAX_LIDAR_AGE, TARGET_HOLD,
     };
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::rprintln;
@@ -816,6 +816,9 @@ mod display {
                         ),
                         Accuracy::Medium => String::from("cal med"),
                         Accuracy::Low => String::from("cal low"),
+                        Accuracy::Unreliable if MAG_CALIBRATION.is_none() => {
+                            String::from("no cal: imu_cal")
+                        }
                         Accuracy::Unreliable => String::from("cal bad - move"),
                     },
                 )
