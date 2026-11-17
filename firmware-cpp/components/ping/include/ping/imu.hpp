@@ -2,8 +2,9 @@
 /// The CEVA/Hillcrest BNO085 nine axis sensor hub, over SPI.
 ///
 /// The SH-2 protocol is CEVA's own sh2 reference library (vendored unchanged
-/// in `components/sh2`), running on our HAL (@ref ping/bno085_hal.hpp) whose
-/// bus behaviour matches the Rust driver. Everything runs in the caller's
+/// in `components/sh2`), running on CEVA's own reference SPI HAL ported to
+/// ESP-IDF (@ref ping/shtp_spi.hpp, @ref ping/bno085_hal.hpp), so the whole
+/// path to the hub is the manufacturer's code. Everything runs in the caller's
 /// task: @ref Imu::next services sh2, which decodes reports into a small ring
 /// buffer, and hands them out one at a time. Nothing is allocated after
 /// construction.
@@ -77,7 +78,7 @@ struct Error {
         kBootTimeout,
         /// The hub booted but never announced that its reset was complete.
         kNoResetNotice,
-        /// The hub did not answer WAKE before a write.
+        /// The hub did not collect a write after WAKE was asserted.
         kWakeTimeout,
         /// An SPI transfer failed.
         kBus,
@@ -101,6 +102,38 @@ struct Error {
 
 /// A short description of an error, for logs and the display.
 const char* to_string(const Error& error);
+
+/// Counters for the SPI link and sh2 above it, to tell a quiet hub from a
+/// broken link. Counts are since construction and wrap at 32 bits; times are
+/// the low 32 bits of `esp_timer` microseconds.
+struct LinkStats {
+    std::uint32_t int_edges;
+    std::uint32_t last_int_us;
+    std::uint32_t transfers_ok;
+    std::uint32_t transfers_failed;
+    /// `esp_err_t` of the last failed transfer, ESP_OK if none.
+    int last_spi_error;
+    /// Cargos with a payload.
+    std::uint32_t cargos_read;
+    /// Header reads of length 0 (INTN with nothing to send).
+    std::uint32_t empty_headers;
+    /// Header reads of length 1 to 4, or all ones.
+    std::uint32_t invalid_headers;
+    /// Cargos longer than the 1024-byte receive buffer, truncated.
+    std::uint32_t oversized_cargos;
+    /// Cargos dropped because sh2's buffer was too small.
+    std::uint32_t discarded_cargos;
+    /// Writes abandoned because the hub never answered WAKE.
+    std::uint32_t wake_timeouts;
+    /// SH2_RESET events from the hub (start-up resets included).
+    std::uint32_t hub_resets;
+    /// SHTP errors sh2 reported (bad sequence numbers, short fragments, ...).
+    std::uint32_t shtp_errors;
+    /// Reports dropped because the queue was full.
+    std::uint32_t dropped_events;
+    std::uint32_t sensor_events;
+    std::uint32_t last_event_us;
+};
 
 /// A BNO085 on the board's IMU pins (see @ref ping/constants.hpp).
 class Imu {
@@ -133,10 +166,7 @@ class Imu {
     /// its own, or a failed transfer, returns an error: start again.
     std::expected<std::optional<Event>, Error> next(std::uint32_t timeout_ms);
 
-    /// Reports dropped because the queue was full when they arrived.
-    [[nodiscard]] std::uint32_t dropped_events() const { return dropped_; }
-    /// Cargos too large for sh2's buffer, read and thrown away.
-    [[nodiscard]] std::uint32_t discarded_cargos() const { return hal_.discarded_cargos(); }
+    [[nodiscard]] LinkStats link_stats() const;
 
   private:
     static void on_event(void* cookie, sh2_AsyncEvent_t* event);
@@ -147,6 +177,7 @@ class Imu {
     /// what went wrong, if anything, into an Error.
     template <typename Op> std::expected<void, Error> run(Op op);
     std::optional<Error> pending_error();
+    std::optional<Error> link_error();
     void push(const Event& event);
     std::optional<Event> pop();
 
@@ -157,6 +188,13 @@ class Imu {
     std::size_t head_ = 0;
     std::size_t count_ = 0;
     std::uint32_t dropped_ = 0;
+    std::uint32_t hub_resets_ = 0;
+    std::uint32_t shtp_errors_ = 0;
+    std::uint32_t sensor_events_ = 0;
+    std::uint32_t last_event_us_ = 0;
+    // Link counters already turned into errors.
+    std::uint32_t seen_transfers_failed_ = 0;
+    std::uint32_t seen_wake_timeouts_ = 0;
     bool started_ = false;
     bool reset_seen_ = false;
 };

@@ -213,6 +213,13 @@ TEST(SpiHal, ReadsHeaderThenBodyOnIntn)
     EXPECT_EQ(t, 10'000U);
     const std::vector<std::string> expected{"cs-", "xfer4", "xfer12", "cs+"};
     EXPECT_EQ(rig.hub.log, expected);
+
+    const auto counters = rig.hal.counters();
+    EXPECT_EQ(counters.int_edges, 1U);
+    EXPECT_EQ(counters.last_int_us, 10'000U);
+    EXPECT_EQ(counters.transfers_ok, 2U);
+    EXPECT_EQ(counters.cargos_read, 1U);
+    EXPECT_EQ(counters.empty_headers, 0U);
 }
 
 TEST(SpiHal, ReadWithoutIntnReturnsNothing)
@@ -252,6 +259,7 @@ TEST(SpiHal, EmptyHeaderEndsTheTransfer)
     EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
     const std::vector<std::string> expected{"cs-", "xfer4", "cs+"};
     EXPECT_EQ(rig.hub.log, expected);
+    EXPECT_EQ(rig.hal.counters().empty_headers, 1U);
 }
 
 TEST(SpiHal, WriteAssertsWakeAndSendsOnIntn)
@@ -340,6 +348,7 @@ TEST(SpiHal, TooSmallBufferDiscardsTheCargo)
     EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), ping::shtp::kSh2ErrBadParam);
     std::array<std::uint8_t, 64> big{};
     EXPECT_EQ(rig.hal.read(big.data(), big.size(), &t), 0);
+    EXPECT_EQ(rig.hal.counters().discarded_cargos, 1U);
 }
 
 TEST(SpiHal, OversizedLengthIsTruncatedToTheBuffer)
@@ -351,6 +360,21 @@ TEST(SpiHal, OversizedLengthIsTruncatedToTheBuffer)
     std::array<std::uint8_t, 1024> buf{};
     std::uint32_t t = 0;
     EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 1024);
+    EXPECT_EQ(rig.hal.counters().oversized_cargos, 1U);
+}
+
+TEST(SpiHal, AllOnesHeaderCountsAsInvalid)
+{
+    Rig rig;
+    rig.hub.boots = false;
+    ASSERT_EQ(rig.hal.open(), ping::shtp::kSh2Ok);
+    rig.hub.queue({0xFF, 0xFF, 0xFF, 0xFF});
+    std::array<std::uint8_t, 1024> buf{};
+    std::uint32_t t = 0;
+    // CEVA's HAL reads a full buffer for it and leaves sh2 to reject it.
+    EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 1024);
+    EXPECT_EQ(rig.hal.counters().invalid_headers, 1U);
+    EXPECT_EQ(rig.hal.counters().cargos_read, 0U);
 }
 
 TEST(SpiHal, BusFailureIsCountedAndRecovered)

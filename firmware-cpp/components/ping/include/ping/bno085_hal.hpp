@@ -44,6 +44,8 @@ class EspSpiBus final : public shtp::SpiBus {
 
     /// What ESP-IDF returned when @ref init_hw last failed, ESP_OK otherwise.
     [[nodiscard]] esp_err_t init_error() const { return init_error_; }
+    /// What the last failed SPI transfer returned, ESP_OK if none has.
+    [[nodiscard]] esp_err_t last_spi_error() const { return last_spi_error_; }
 
     bool init_hw() override;
     void deinit_hw() override;
@@ -67,6 +69,7 @@ class EspSpiBus final : public shtp::SpiBus {
     bool bus_ready_ = false;
     bool isr_added_ = false;
     esp_err_t init_error_ = ESP_OK;
+    esp_err_t last_spi_error_ = ESP_OK;
     SemaphoreHandle_t intn_ = nullptr;
     StaticSemaphore_t intn_storage_{};
 };
@@ -83,6 +86,7 @@ class Hal {
     shtp::SpiHal& spi() { return spi_; }
     [[nodiscard]] const shtp::SpiHal& spi() const { return spi_; }
     [[nodiscard]] esp_err_t init_error() const { return bus_.init_error(); }
+    [[nodiscard]] esp_err_t last_spi_error() const { return bus_.last_spi_error(); }
     std::uint32_t now_us() { return spi_.get_time_us(); }
 
   private:

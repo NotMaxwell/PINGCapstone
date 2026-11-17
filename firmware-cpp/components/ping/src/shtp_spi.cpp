@@ -138,7 +138,7 @@ void SpiHal::spi_completed()
     // Get length of payload available
     auto rx_len = static_cast<std::uint16_t>((rx_buf_[0] + (rx_buf_[1] << 8)) & ~0x8000);
 
-    if (spi_state_ == SpiState::kRdHdr || spi_state_ == SpiState::kWrite) {
+    if (spi_state_ == SpiState::kRdHdr || (spi_state_ == SpiState::kWrite && rx_len != 0)) {
         count_header(rx_len);
     }
 

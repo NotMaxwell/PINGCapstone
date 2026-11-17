@@ -11,13 +11,14 @@ namespace ping::imu {
 
 namespace {
 
-/// How long the hub may take to answer a request, as in the Rust driver.
-constexpr std::uint32_t kResponseTimeoutMs = 1'000;
-/// How long to wait for "reset complete" after the hub has booted. The Rust
-/// driver allows the same for its soft reset.
+/// How long the hub may take to answer a request before the operation is
+/// aborted (sh2 itself would wait forever).
+constexpr std::uint32_t kResponseTimeoutUs = 1'000'000;
+/// How long to wait for "reset complete" after the hub has booted, beyond
+/// the 200 ms sh2_open itself waits.
 constexpr std::uint32_t kResetTimeoutMs = 1'000;
 /// How long one HAL read blocks on INT inside sh2's polling loops.
-constexpr std::uint32_t kPollWaitMs = 5;
+constexpr std::uint32_t kPollWaitUs = 5'000;
 
 constexpr sh2_SensorId_t to_sh2(SensorId sensor)
 {
@@ -109,21 +110,6 @@ bool decode(const sh2_SensorValue_t& value, Event& out)
     }
 }
 
-Error from_hal(const bno085::HalError& error)
-{
-    switch (error.kind) {
-    case bno085::HalError::Kind::kInit:
-        return {.kind = Error::Kind::kInit, .code = error.esp};
-    case bno085::HalError::Kind::kBootTimeout:
-        return {.kind = Error::Kind::kBootTimeout};
-    case bno085::HalError::Kind::kWakeTimeout:
-        return {.kind = Error::Kind::kWakeTimeout};
-    case bno085::HalError::Kind::kBus:
-        break;
-    }
-    return {.kind = Error::Kind::kBus};
-}
-
 Error from_status(int status)
 {
     switch (status) {
@@ -189,8 +175,11 @@ void Imu::on_event(void* cookie, sh2_AsyncEvent_t* event)
     auto* self = static_cast<Imu*>(cookie);
     // The HAL's own made-up reset notice, used to abort an operation that
     // timed out, is not a hub reset.
-    if (event->eventId == SH2_RESET && !self->hal_.aborted()) {
+    if (event->eventId == SH2_RESET && !self->hal_.spi().aborted()) {
         self->reset_seen_ = true;
+        ++self->hub_resets_;
+    } else if (event->eventId == SH2_SHTP_EVENT) {
+        ++self->shtp_errors_;
     }
 }
 
@@ -201,6 +190,8 @@ void Imu::on_sensor(void* cookie, sh2_SensorEvent_t* event)
     if (sh2_decodeSensorEvent(&value, event) != SH2_OK) {
         return;
     }
+    ++self->sensor_events_;
+    self->last_event_us_ = self->hal_.now_us();
     Event decoded{};
     if (decode(value, decoded)) {
         self->push(decoded);
@@ -248,10 +239,44 @@ std::optional<Error> Imu::pending_error()
         started_ = false;
         return Error{.kind = Error::Kind::kHubReset};
     }
-    if (const auto error = hal_.take_error()) {
-        return from_hal(*error);
+    return link_error();
+}
+
+std::optional<Error> Imu::link_error()
+{
+    const shtp::LinkCounters counters = hal_.spi().counters();
+    std::optional<Error> error;
+    if (counters.transfers_failed != seen_transfers_failed_) {
+        error = Error{.kind = Error::Kind::kBus, .code = hal_.last_spi_error()};
+    } else if (counters.wake_timeouts != seen_wake_timeouts_) {
+        error = Error{.kind = Error::Kind::kWakeTimeout};
     }
-    return std::nullopt;
+    seen_transfers_failed_ = counters.transfers_failed;
+    seen_wake_timeouts_ = counters.wake_timeouts;
+    return error;
+}
+
+LinkStats Imu::link_stats() const
+{
+    const shtp::LinkCounters c = hal_.spi().counters();
+    return LinkStats{
+        .int_edges = c.int_edges,
+        .last_int_us = c.last_int_us,
+        .transfers_ok = c.transfers_ok,
+        .transfers_failed = c.transfers_failed,
+        .last_spi_error = hal_.last_spi_error(),
+        .cargos_read = c.cargos_read,
+        .empty_headers = c.empty_headers,
+        .invalid_headers = c.invalid_headers,
+        .oversized_cargos = c.oversized_cargos,
+        .discarded_cargos = c.discarded_cargos,
+        .wake_timeouts = c.wake_timeouts,
+        .hub_resets = hub_resets_,
+        .shtp_errors = shtp_errors_,
+        .dropped_events = dropped_,
+        .sensor_events = sensor_events_,
+        .last_event_us = last_event_us_,
+    };
 }
 
 template <typename Op> std::expected<void, Error> Imu::run(Op op)
@@ -259,10 +284,10 @@ template <typename Op> std::expected<void, Error> Imu::run(Op op)
     if (auto error = pending_error()) {
         return std::unexpected(*error);
     }
-    hal_.arm_deadline(kResponseTimeoutMs);
+    hal_.spi().arm_deadline(kResponseTimeoutUs);
     const int status = op();
-    const bool aborted = hal_.aborted();
-    hal_.disarm_deadline();
+    const bool aborted = hal_.spi().aborted();
+    hal_.spi().disarm_deadline();
 
     if (auto error = pending_error()) {
         return std::unexpected(*error);
@@ -282,38 +307,29 @@ std::expected<ProductId, Error> Imu::start()
     reset_seen_ = false;
     head_ = 0;
     count_ = 0;
-    hal_.disarm_deadline();
-    (void)hal_.take_error();
-    hal_.set_read_wait_ms(kPollWaitMs);
+    hal_.spi().disarm_deadline();
+    hal_.spi().set_read_wait_us(kPollWaitUs);
+    (void)link_error();
 
     // Harmless when sh2 is not open; otherwise it closes the HAL, which holds
     // the hub in reset until sh2_open opens it again.
     sh2_close();
 
-    // The HAL's open rebuilds the bus and hard-resets the hub; sh2_open then
-    // waits up to 200 ms for the reset notice.
+    // The HAL's open rebuilds the bus and hard-resets the hub (CEVA's
+    // sequence); sh2_open then waits up to 200 ms for the reset notice.
     const int status = sh2_open(hal_.sh2(), on_event, this);
     if (status != SH2_OK) {
-        if (const auto error = hal_.take_error()) {
-            return std::unexpected(from_hal(*error));
+        if (hal_.init_error() != ESP_OK) {
+            return std::unexpected(Error{.kind = Error::Kind::kInit, .code = hal_.init_error()});
         }
         return std::unexpected(from_status(status));
     }
-
+    if (hal_.spi().in_reset()) {
+        return std::unexpected(Error{.kind = Error::Kind::kBootTimeout});
+    }
     if (!wait_for_reset(kResetTimeoutMs)) {
-        // The Rust driver always follows the hard reset with a soft one; sh2
-        // needs the hard reset only, so the soft one is kept as a fallback.
-        if (const auto error = hal_.take_error()) {
-            return std::unexpected(from_hal(*error));
-        }
-        if (const int sent = sh2_devReset(); sent != SH2_OK) {
-            const auto error = hal_.take_error();
-            return std::unexpected(error ? from_hal(*error) : from_status(sent));
-        }
-        if (!wait_for_reset(kResetTimeoutMs)) {
-            const auto error = hal_.take_error();
-            return std::unexpected(error ? from_hal(*error) : Error{.kind = Error::Kind::kNoResetNotice});
-        }
+        const auto error = link_error();
+        return std::unexpected(error ? *error : Error{.kind = Error::Kind::kNoResetNotice});
     }
 
     sh2_setSensorCallback(on_sensor, this);
@@ -354,8 +370,7 @@ std::expected<void, Error> Imu::configure_calibration(bool accel, bool gyro, boo
     if (auto set = run([&] { return sh2_setCalConfig(wanted); }); !set) {
         return set;
     }
-    // sh2 checks only the status of the answer; the Rust driver also checks
-    // what the hub reports enabled, which here takes a second request.
+    // sh2 checks only the status of the answer, so read the setting back.
     std::uint8_t enabled = 0;
     if (auto got = run([&] { return sh2_getCalConfig(&enabled); }); !got) {
         return got;
@@ -395,9 +410,9 @@ std::expected<std::optional<Event>, Error> Imu::next(std::uint32_t timeout_ms)
         }
         // Block on INT for the rest of the timeout rather than sh2's usual
         // short poll, so an idle hub costs no CPU.
-        hal_.set_read_wait_ms(elapsed_ms < timeout_ms ? timeout_ms - elapsed_ms : 0);
+        hal_.spi().set_read_wait_us((elapsed_ms < timeout_ms ? timeout_ms - elapsed_ms : 0) * 1000U);
         sh2_service();
-        hal_.set_read_wait_ms(kPollWaitMs);
+        hal_.spi().set_read_wait_us(kPollWaitUs);
         serviced = true;
     }
 }

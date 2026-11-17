@@ -190,6 +190,7 @@ bool EspSpiBus::transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t l
         t.rx_buffer = rx + done;
         if (const esp_err_t err = spi_device_polling_transmit(device_, &t); err != ESP_OK) {
             ESP_LOGE(kTag, "SPI transfer: %s", esp_err_to_name(err));
+            last_spi_error_ = err;
             return false;
         }
         done += n;

@@ -331,10 +331,31 @@ void log_compass(const Orientation& orientation)
                  : " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)");
 }
 
+/// Says what the IMU's wire did, so a dropout can be pinned on the hub (no
+/// INT edges), the bus (failed transfers, bad headers) or a hub reset.
+void log_imu_link(const imu::Imu& imu)
+{
+    const imu::LinkStats s = imu.link_stats();
+    const auto now = static_cast<std::uint32_t>(esp_timer_get_time());
+    ESP_LOGW(kTag,
+             "BNO085 link: %" PRIu32 " INT edges (last %" PRIu32 " ms ago), %" PRIu32 " transfers ok, %" PRIu32
+             " failed (last %s), %" PRIu32 " cargos, %" PRIu32 " empty / %" PRIu32 " invalid headers, %" PRIu32
+             " oversized, %" PRIu32 " wake timeouts, %" PRIu32 " hub resets, %" PRIu32 " SHTP errors, %" PRIu32
+             " events (last %" PRIu32 " ms ago), %" PRIu32 " dropped",
+             s.int_edges, (now - s.last_int_us) / 1000, s.transfers_ok, s.transfers_failed,
+             esp_err_to_name(s.last_spi_error), s.cargos_read, s.empty_headers, s.invalid_headers, s.oversized_cargos,
+             s.wake_timeouts, s.hub_resets, s.shtp_errors, s.sensor_events, (now - s.last_event_us) / 1000,
+             s.dropped_events);
+}
+
 /// Resets the hub and starts the reports the compass is built from.
-std::expected<imu::ProductId, imu::Error> start_imu(imu::Imu& imu)
+///
+/// Each step can wait seconds for the hub (CEVA's HAL allows 2 s for it to
+/// boot, and each request up to 1 s), so the watchdog is fed between steps.
+std::expected<imu::ProductId, imu::Error> start_imu(imu::Imu& imu, const rtos::Watchdog& watchdog)
 {
     auto id = imu.start();
+    watchdog.feed();
     if (!id) {
         return id;
     }
@@ -343,9 +364,11 @@ std::expected<imu::ProductId, imu::Error> start_imu(imu::Imu& imu)
     if (auto r = imu.configure_calibration(true, false, false); !r) {
         return std::unexpected(r.error());
     }
+    watchdog.feed();
     if (auto r = imu.enable_report(imu::SensorId::kGameRotationVector, kImuReportIntervalUs); !r) {
         return std::unexpected(r.error());
     }
+    watchdog.feed();
     if (auto r = imu.enable_report(imu::SensorId::kMagneticFieldUncalibrated, kMagReportIntervalUs); !r) {
         return std::unexpected(r.error());
     }
@@ -360,9 +383,10 @@ void imu_task(void* /*arg*/)
 
     for (;;) {
         watchdog.feed();
-        const auto id = start_imu(imu);
+        const auto id = start_imu(imu, watchdog);
         if (!id) {
             ESP_LOGW(kTag, "BNO085 bring-up failed: %s, retrying", imu::to_string(id.error()));
+            log_imu_link(imu);
             delay_ms(kRetryDelayMs);
             continue;
         }
@@ -380,11 +404,13 @@ void imu_task(void* /*arg*/)
             const auto event = imu.next(kImuSilenceMs);
             if (!event) {
                 ESP_LOGW(kTag, "BNO085 failed: %s, starting it again", imu::to_string(event.error()));
+                log_imu_link(imu);
                 break;
             }
             if (!*event) {
                 if (now_ms() - last >= kImuSilenceMs) {
                     ESP_LOGW(kTag, "BNO085 went quiet, starting it again");
+                    log_imu_link(imu);
                     break;
                 }
                 continue;

@@ -2,7 +2,7 @@
 # BNO085 transport are our own). The ESP-IDF component manager
 # fetches them into managed_components/ on the first build.
 dependencies:
-  idf: ">=6.0"
+  idf: ">=6.1"
 
   # Monochrome display library: SH1106 and SSD1306 controllers and the fonts.
   # Upstream ships its own idf_component_register.
