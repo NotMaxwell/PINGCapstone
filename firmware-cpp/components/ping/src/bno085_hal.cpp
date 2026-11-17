@@ -1,3 +1,17 @@
+// The hardware layer under CEVA's SPI HAL (shtp_spi.cpp), standing in for the
+// STM32 HAL calls in CEVA's sh2-demo-nucleo app/spi_hal.c. Deviations from
+// that file at this layer:
+//
+// - Timer: esp_timer instead of TIM2 (both a 32-bit microsecond count).
+// - The INTN ISR records the time, calls SpiHal::on_intn and gives a binary
+//   semaphore; it starts no transfer (see shtp_spi.cpp for why).
+// - enable_ints treats INTN already low as an edge: the STM32 EXTI latches an
+//   edge while its interrupt is masked, and the ESP32 GPIO interrupt is not
+//   relied on to.
+// - SPI without DMA, in 64-byte chunks under one CSN assertion: with DMA,
+//   ESP-IDF copies unaligned buffers through a heap bounce buffer on every
+//   transfer.
+
 #include "ping/bno085_hal.hpp"
 
 #include <esp_attr.h>
@@ -11,7 +25,6 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
-#include <cstring>
 
 namespace ping::bno085 {
 
@@ -19,19 +32,15 @@ namespace {
 
 constexpr const char* kTag = "bno085";
 
-static_assert(shtp::kMaxCargo == SH2_HAL_MAX_TRANSFER_IN);
-static_assert(shtp::kMaxWrite == SH2_HAL_MAX_TRANSFER_OUT);
+static_assert(shtp::kSh2Ok == SH2_OK && shtp::kSh2Err == SH2_ERR && shtp::kSh2ErrBadParam == SH2_ERR_BAD_PARAM &&
+              shtp::kSh2ErrIo == SH2_ERR_IO && shtp::kSh2ErrTimeout == SH2_ERR_TIMEOUT);
+static_assert(shtp::kMaxTransferIn == SH2_HAL_MAX_TRANSFER_IN && shtp::kMaxTransferOut == SH2_HAL_MAX_TRANSFER_OUT);
 
-// Without DMA a transaction is limited to the 64-byte hardware FIFO, but any
-// buffer works: with DMA, ESP-IDF would copy unaligned or odd-length buffers
-// through a heap-allocated bounce buffer on every transfer.
 constexpr std::size_t kChunk = 64;
 
-const std::array<std::uint8_t, kChunk> kZeros{};
-std::array<std::uint8_t, kChunk> g_sink{};
-
-TickType_t ticks_for(std::uint32_t ms)
+TickType_t ticks_for_us(std::uint32_t us)
 {
+    const std::uint32_t ms = (us + 999U) / 1000U;
     const TickType_t ticks = pdMS_TO_TICKS(ms);
     return ms > 0 && ticks == 0 ? 1 : ticks;
 }
@@ -44,27 +53,37 @@ std::uint32_t level(bool high) { return high ? 1U : 0U; }
 // EspSpiBus
 // ---------------------------------------------------------------------------
 
-void IRAM_ATTR EspSpiBus::on_int(void* arg)
+void IRAM_ATTR EspSpiBus::on_intn(void* arg)
 {
     auto* self = static_cast<EspSpiBus*>(arg);
+    self->hal_.on_intn(static_cast<std::uint32_t>(esp_timer_get_time()));
     BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(self->int_falling_, &woken);
+    xSemaphoreGiveFromISR(self->intn_, &woken);
     portYIELD_FROM_ISR(woken);
 }
 
-esp_err_t EspSpiBus::init()
+bool EspSpiBus::init_hw()
 {
-    deinit();
+    deinit_hw();
+    init_error_ = setup();
+    if (init_error_ != ESP_OK) {
+        deinit_hw();
+        return false;
+    }
+    return true;
+}
 
-    if (int_falling_ == nullptr) {
-        int_falling_ = xSemaphoreCreateBinaryStatic(&int_falling_storage_);
+esp_err_t EspSpiBus::setup()
+{
+    if (intn_ == nullptr) {
+        intn_ = xSemaphoreCreateBinaryStatic(&intn_storage_);
     }
 
-    // Levels are latched before the pins become outputs, so CS and WAKE never
-    // glitch low. PS0 (WAKE) high is what selects SPI at the next reset.
-    gpio_set_level(pins_.cs, 1);
-    gpio_set_level(pins_.wake, 1);
-    gpio_set_level(pins_.reset, 1);
+    // hal_init_gpio / hal_init_spi: PS0_WAKEN, RSTN and CSN start low. The
+    // levels are latched before the pins become outputs.
+    gpio_set_level(pins_.wake, 0);
+    gpio_set_level(pins_.reset, 0);
+    gpio_set_level(pins_.cs, 0);
     gpio_config_t outputs{};
     outputs.pin_bit_mask = (1ULL << pins_.cs) | (1ULL << pins_.wake) | (1ULL << pins_.reset);
     outputs.mode = GPIO_MODE_OUTPUT;
@@ -74,9 +93,6 @@ esp_err_t EspSpiBus::init()
         ESP_LOGE(kTag, "control pins: %s", esp_err_to_name(err));
         return err;
     }
-    gpio_set_level(pins_.cs, 1);
-    gpio_set_level(pins_.wake, 1);
-    gpio_set_level(pins_.reset, 1);
 
     gpio_config_t input{};
     input.pin_bit_mask = 1ULL << pins_.intr;
@@ -85,9 +101,11 @@ esp_err_t EspSpiBus::init()
     input.intr_type = GPIO_INTR_NEGEDGE;
     err = gpio_config(&input);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "INT pin: %s", esp_err_to_name(err));
+        ESP_LOGE(kTag, "INTN pin: %s", esp_err_to_name(err));
         return err;
     }
+    // Masked until enable_ints, as CEVA leaves the EXTI IRQ until then.
+    gpio_intr_disable(pins_.intr);
 
     // Another driver may have installed the shared ISR service already; that
     // is fine, and it is never uninstalled here for the same reason.
@@ -96,9 +114,9 @@ esp_err_t EspSpiBus::init()
         ESP_LOGE(kTag, "GPIO ISR service: %s", esp_err_to_name(err));
         return err;
     }
-    err = gpio_isr_handler_add(pins_.intr, on_int, this);
+    err = gpio_isr_handler_add(pins_.intr, on_intn, this);
     if (err != ESP_OK) {
-        ESP_LOGE(kTag, "INT handler: %s", esp_err_to_name(err));
+        ESP_LOGE(kTag, "INTN handler: %s", esp_err_to_name(err));
         return err;
     }
     isr_added_ = true;
@@ -118,11 +136,9 @@ esp_err_t EspSpiBus::init()
     bus_ready_ = true;
 
     spi_device_interface_config_t device{};
-    device.mode = 3;
+    device.mode = 3; // CPOL high, CPHA second edge, as CEVA configures SPI1
     device.clock_speed_hz = static_cast<int>(pins_.frequency_hz);
-    // CS is driven by hand: a read must see the header before it knows how
-    // long to keep CS low.
-    device.spics_io_num = -1;
+    device.spics_io_num = -1; // CSN is driven by hand (SPI_NSS_SOFT)
     device.queue_size = 1;
     err = spi_bus_add_device(pins_.host, &device, &device_);
     if (err != ESP_OK) {
@@ -133,8 +149,15 @@ esp_err_t EspSpiBus::init()
     return ESP_OK;
 }
 
-void EspSpiBus::deinit()
+void EspSpiBus::deinit_hw()
 {
+    if (isr_added_) {
+        gpio_intr_disable(pins_.intr);
+        if (const esp_err_t err = gpio_isr_handler_remove(pins_.intr); err != ESP_OK) {
+            ESP_LOGW(kTag, "removing INTN handler: %s", esp_err_to_name(err));
+        }
+        isr_added_ = false;
+    }
     if (device_ != nullptr) {
         if (const esp_err_t err = spi_bus_remove_device(device_); err != ESP_OK) {
             ESP_LOGW(kTag, "removing SPI device: %s", esp_err_to_name(err));
@@ -147,36 +170,11 @@ void EspSpiBus::deinit()
         }
         bus_ready_ = false;
     }
-    if (isr_added_) {
-        if (const esp_err_t err = gpio_isr_handler_remove(pins_.intr); err != ESP_OK) {
-            ESP_LOGW(kTag, "removing INT handler: %s", esp_err_to_name(err));
-        }
-        isr_added_ = false;
-    }
 }
 
-void EspSpiBus::set_cs(bool high) { gpio_set_level(pins_.cs, level(high)); }
-void EspSpiBus::set_wake(bool high) { gpio_set_level(pins_.wake, level(high)); }
-void EspSpiBus::set_reset(bool high) { gpio_set_level(pins_.reset, level(high)); }
-bool EspSpiBus::int_high() { return gpio_get_level(pins_.intr) != 0; }
-
-bool EspSpiBus::wait_int_low(std::uint32_t timeout_ms)
-{
-    if (!int_high()) {
-        return true;
-    }
-    if (timeout_ms == 0 || int_falling_ == nullptr) {
-        return false;
-    }
-    // Clear a stale edge, then look again before blocking, so an edge between
-    // the first look and the take is not missed.
-    xSemaphoreTake(int_falling_, 0);
-    if (!int_high()) {
-        return true;
-    }
-    const bool fell = xSemaphoreTake(int_falling_, ticks_for(timeout_ms)) == pdTRUE;
-    return fell || !int_high();
-}
+void EspSpiBus::rstn(bool high) { gpio_set_level(pins_.reset, level(high)); }
+void EspSpiBus::ps0_waken(bool high) { gpio_set_level(pins_.wake, level(high)); }
+void EspSpiBus::csn(bool high) { gpio_set_level(pins_.cs, level(high)); }
 
 bool EspSpiBus::transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t len)
 {
@@ -188,8 +186,8 @@ bool EspSpiBus::transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t l
         const std::size_t n = std::min(len - done, kChunk);
         spi_transaction_t t{};
         t.length = n * 8;
-        t.tx_buffer = tx != nullptr ? tx + done : kZeros.data();
-        t.rx_buffer = rx != nullptr ? rx + done : g_sink.data();
+        t.tx_buffer = tx + done;
+        t.rx_buffer = rx + done;
         if (const esp_err_t err = spi_device_polling_transmit(device_, &t); err != ESP_OK) {
             ESP_LOGE(kTag, "SPI transfer: %s", esp_err_to_name(err));
             return false;
@@ -199,120 +197,54 @@ bool EspSpiBus::transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t l
     return true;
 }
 
-void EspSpiBus::delay_ms(std::uint32_t ms) { vTaskDelay(ticks_for(ms)); }
+void EspSpiBus::enable_ints()
+{
+    if (!isr_added_) {
+        return;
+    }
+    gpio_intr_enable(pins_.intr);
+    if (gpio_get_level(pins_.intr) == 0) {
+        hal_.on_intn(time_now_us());
+        xSemaphoreGive(intn_);
+    }
+}
 
-std::uint32_t EspSpiBus::now_us() { return static_cast<std::uint32_t>(esp_timer_get_time()); }
+void EspSpiBus::disable_ints()
+{
+    if (isr_added_) {
+        gpio_intr_disable(pins_.intr);
+    }
+}
+
+void EspSpiBus::wait_int(std::uint32_t timeout_us)
+{
+    if (intn_ != nullptr && timeout_us > 0) {
+        xSemaphoreTake(intn_, ticks_for_us(timeout_us));
+    }
+}
+
+void EspSpiBus::delay_us(std::uint32_t us) { vTaskDelay(ticks_for_us(us)); }
+
+std::uint32_t EspSpiBus::time_now_us() { return static_cast<std::uint32_t>(esp_timer_get_time()); }
 
 // ---------------------------------------------------------------------------
 // Hal
 // ---------------------------------------------------------------------------
 
 Hal::Hal(const Pins& pins)
-    : bus_(pins), transport_(bus_),
+    : spi_(bus_), bus_(pins, spi_),
       glue_{.hal = {.open = open, .close = close, .read = read, .write = write, .getTimeUs = get_time_us},
             .self = this}
 {
 }
 
-void Hal::record(HalError error)
-{
-    if (!error_) {
-        error_ = error;
-    }
-}
-
-std::optional<HalError> Hal::take_error()
-{
-    auto error = error_;
-    error_.reset();
-    return error;
-}
-
-void Hal::arm_deadline(std::uint32_t timeout_ms)
-{
-    deadline_armed_ = true;
-    aborted_ = false;
-    deadline_start_us_ = bus_.now_us();
-    deadline_us_ = timeout_ms * 1000U;
-}
-
-int Hal::open(sh2_Hal_t* hal)
-{
-    Hal& self = from(hal);
-    if (const esp_err_t err = self.bus_.init(); err != ESP_OK) {
-        self.record({.kind = HalError::Kind::kInit, .esp = err});
-        return SH2_ERR_IO;
-    }
-    if (const auto reset = self.transport_.reset(); !reset) {
-        ESP_LOGE(kTag, "no INT within %u ms of reset", static_cast<unsigned>(shtp::kBootTimeoutMs));
-        self.record({.kind = HalError::Kind::kBootTimeout});
-        return SH2_ERR_TIMEOUT;
-    }
-    return SH2_OK;
-}
-
-void Hal::close(sh2_Hal_t* hal)
-{
-    // Held in reset until the next open, as sh2_hal.h asks; the bus itself is
-    // rebuilt by the next open.
-    from(hal).bus_.set_reset(false);
-}
-
+int Hal::open(sh2_Hal_t* hal) { return from(hal).spi_.open(); }
+void Hal::close(sh2_Hal_t* hal) { from(hal).spi_.close(); }
 int Hal::read(sh2_Hal_t* hal, std::uint8_t* buffer, unsigned len, std::uint32_t* t_us)
 {
-    Hal& self = from(hal);
-    *t_us = self.bus_.now_us();
-
-    if (self.deadline_armed_ && *t_us - self.deadline_start_us_ >= self.deadline_us_) {
-        self.deadline_armed_ = false;
-        self.aborted_ = true;
-        // Executable channel, "reset complete": sh2 aborts its operation.
-        constexpr std::array<std::uint8_t, 5> kResetComplete{5, 0, 1, 0, 1};
-        if (len >= kResetComplete.size()) {
-            std::memcpy(buffer, kResetComplete.data(), kResetComplete.size());
-            return static_cast<int>(kResetComplete.size());
-        }
-    }
-
-    const auto got = self.transport_.read({buffer, len}, self.read_wait_ms_);
-    if (got) {
-        return static_cast<int>(*got);
-    }
-    if (got.error().kind == shtp::Error::Kind::kCargoTooLarge) {
-        ++self.discarded_;
-        ESP_LOGW(kTag, "discarded a %u-byte cargo", static_cast<unsigned>(got.error().cargo_len));
-    } else {
-        self.record({.kind = HalError::Kind::kBus});
-    }
-    return 0;
+    return from(hal).spi_.read(buffer, len, t_us);
 }
-
-int Hal::write(sh2_Hal_t* hal, std::uint8_t* buffer, unsigned len)
-{
-    Hal& self = from(hal);
-    // A write would overwrite the stash with whatever it clocks in. Returning
-    // 0 makes sh2 service (which reads the stash) and try again.
-    if (self.transport_.has_stash()) {
-        return 0;
-    }
-    const auto sent = self.transport_.write({buffer, len});
-    if (sent) {
-        return static_cast<int>(len);
-    }
-    switch (sent.error().kind) {
-    case shtp::Error::Kind::kTimeout:
-        self.record({.kind = HalError::Kind::kWakeTimeout});
-        return SH2_ERR_TIMEOUT;
-    case shtp::Error::Kind::kBadLength:
-        return SH2_ERR_BAD_PARAM;
-    case shtp::Error::Kind::kBus:
-    case shtp::Error::Kind::kCargoTooLarge:
-        break;
-    }
-    self.record({.kind = HalError::Kind::kBus});
-    return SH2_ERR_IO;
-}
-
-std::uint32_t Hal::get_time_us(sh2_Hal_t* hal) { return from(hal).bus_.now_us(); }
+int Hal::write(sh2_Hal_t* hal, std::uint8_t* buffer, unsigned len) { return from(hal).spi_.write(buffer, len); }
+std::uint32_t Hal::get_time_us(sh2_Hal_t* hal) { return from(hal).spi_.get_time_us(); }
 
 } // namespace ping::bno085
