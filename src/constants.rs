@@ -245,7 +245,16 @@ pub const LIDAR_BORESIGHT: Vec3 = Vec3 {
 ///
 /// Calibrate again whenever anything magnetic near the IMU is added, moved
 /// or taken away. `docs/heading-calibration.md` is the procedure.
-pub const MAG_CALIBRATION: Option<MagCalibration> = None;
+pub const MAG_CALIBRATION: Option<MagCalibration> = Some(MagCalibration {
+    offset: [2.8076, 5.7612, -33.7220],
+    matrix: [
+        [1.000541, 0.235268, 0.029401],
+        [0.235268, 0.997810, 0.051017],
+        [0.029401, 0.051017, 1.063374],
+    ],
+    field_ut: 63.463,
+    residual: 0.02677,
+});
 
 /// Earth's field in Huntsville, Alabama, from the World Magnetic Model
 /// (WMM2025) for late 2026: total strength, µT, which the field `imu_cal`
