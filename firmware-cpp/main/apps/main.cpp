@@ -12,102 +12,131 @@
 ///
 /// When the button is pressed, the main task takes the latest reading from
 /// each and walks the LiDAR's range out from the GPS position along that
-/// direction (see @ref ping/geo.hpp). The result goes to the USB serial port,
-/// one line per press, alongside the logs, where `idf.py monitor` or any
-/// serial monitor shows it.
+/// direction (see @ref ping/geo.hpp). Without a fix it walks out from
+/// @ref ping::kFallbackPosition instead, if one is set, and says so. The
+/// result goes to the USB serial port, one line per press, alongside the logs.
+/// The display shows the live heading, compass calibration, range and GPS
+/// state, and after each press the target for @ref ping::kTargetHoldMs.
 ///
-/// Before trusting the bearings, set @ref ping::kLidarBoresight to how the
-/// LiDAR is mounted against the IMU and @ref ping::kMagneticDeclinationDeg to
-/// where the device is used. Both live in @ref ping/constants.hpp, with the
-/// pin map and every other fixed setting.
+/// The bearing comes from @ref ping::mag_cal::Compass (game rotation vector
+/// plus the ESP32's own magnetometer correction), measured from true north
+/// with @ref ping::kHeadingCorrectionDeg. `docs/heading-calibration.md` is the
+/// procedure.
+///
+/// Every task recovers from its own sensor's failures: a sensor that stops
+/// answering is brought up again, and a missing display is retried, so one
+/// bad connection never stops the others.
 
 #include "ping/constants.hpp"
+#include "ping/display.hpp"
 #include "ping/geo.hpp"
 #include "ping/gps.hpp"
 #include "ping/imu.hpp"
+#include "ping/mag_cal.hpp"
+#include "ping/rtos.hpp"
 #include "ping/tf03.hpp"
 
 #include <driver/gpio.h>
 #include <esp_log.h>
-#include <esp_timer.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include <esp_system.h>
 
-#include <cstdarg>
+#include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <expected>
-#include <mutex>
 #include <numbers>
 #include <optional>
-#include <string>
+#include <utility>
+#include <variant>
 
 namespace {
 
 using namespace ping;
+using rtos::delay_ms;
+using rtos::now_ms;
 
 constexpr const char* kTag = "ping";
 
-/// Each sensor task's stack, in bytes.
-constexpr std::uint32_t kSensorStack = 6 * 1024;
+/// Stack per task, bytes. The sensor tasks format log lines with printf,
+/// which wants a couple of kilobytes on its own.
+constexpr std::uint32_t kTaskStack = 6 * 1024;
+constexpr UBaseType_t kSensorPriority = 5;
+/// Below the sensors: a slow display never delays a reading.
+constexpr UBaseType_t kDisplayPriority = 3;
 
 /// How often the main task looks at the button.
 constexpr std::uint32_t kButtonPollMs = 5;
 
-std::int64_t now_ms() { return esp_timer_get_time() / 1000; }
+constexpr float kDegPerRad = 180.0F / std::numbers::pi_v<float>;
 
-std::string format(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-std::string format(const char* fmt, ...)
-{
-    char buf[160];
-    va_list args;
-    va_start(args, fmt);
-    std::vsnprintf(buf, sizeof buf, fmt, args);
-    va_end(args);
-    return buf;
-}
+/// What the IMU task keeps from each compass update.
+struct Orientation {
+    geo::Quaternion quaternion;
+    float heading_accuracy_rad;
+    geo::Accuracy calibration;
 
-/// Why a press produced no coordinate, as a sentence.
-using Problem = std::string;
-
-/// The latest reading from one sensor, and when it arrived. The sensor's task
-/// overwrites it; a button press copies it out.
-template <typename T>
-class Latest {
-  public:
-    explicit Latest(const char* sensor) : sensor_(sensor) {}
-
-    void set(const T& value)
+    /// Where the LiDAR points, as a true bearing and an elevation.
+    [[nodiscard]] geo::Aim aim() const
     {
-        const std::lock_guard lock(mutex_);
-        reading_ = value;
-        at_ms_ = now_ms();
+        return geo::Aim::from_orientation(quaternion, kLidarBoresight, kHeadingCorrectionDeg);
     }
-
-    /// The reading, as long as it is no older than `max_age_ms`.
-    std::expected<T, Problem> get(std::uint32_t max_age_ms)
-    {
-        const std::lock_guard lock(mutex_);
-        if (!reading_) {
-            return std::unexpected(format("no %s reading yet", sensor_));
-        }
-        const std::int64_t age = now_ms() - at_ms_;
-        if (age > max_age_ms) {
-            return std::unexpected(format("last %s reading is %lld ms old", sensor_, static_cast<long long>(age)));
-        }
-        return *reading_;
-    }
-
-  private:
-    const char* sensor_;
-    std::mutex mutex_;
-    std::optional<T> reading_;
-    std::int64_t at_ms_ = 0;
 };
 
-Latest<gps::Solution> g_gps{"GPS"};
-Latest<imu::Orientation> g_imu{"IMU"};
-Latest<tf03::Measurement> g_lidar{"LiDAR"};
+// ---------------------------------------------------------------------------
+// Why a press found nothing
+// ---------------------------------------------------------------------------
+
+struct Stale {
+    const char* sensor;
+    rtos::Age age;
+};
+struct NoFix {
+    gps::FixType fix_type;
+    std::uint8_t satellites;
+};
+struct NoReturn {
+    std::uint16_t strength;
+};
+using Problem = std::variant<Stale, NoFix, NoReturn>;
+
+/// A sentence for the serial line.
+Text describe(const Problem& problem)
+{
+    if (const auto* p = std::get_if<Stale>(&problem)) {
+        if (!p->age.ms) {
+            return Text("no %s reading yet", p->sensor);
+        }
+        return Text("last %s reading is %" PRId64 " ms old", p->sensor, *p->age.ms);
+    }
+    if (const auto* p = std::get_if<NoFix>(&problem)) {
+        return Text("GPS has no usable fix (%s, %u sats)", gps::to_string(p->fix_type), p->satellites);
+    }
+    return Text("LiDAR has no trusted return (strength %u)", std::get<NoReturn>(problem).strength);
+}
+
+/// The same in two lines short enough for the display.
+std::pair<Text, Text> explain(const Problem& problem)
+{
+    if (const auto* p = std::get_if<Stale>(&problem)) {
+        if (!p->age.ms) {
+            return {Text("no %s", p->sensor), Text("reading yet")};
+        }
+        return {Text("%s silent", p->sensor), Text("for %.1f s", static_cast<double>(*p->age.ms) / 1000.0)};
+    }
+    if (const auto* p = std::get_if<NoFix>(&problem)) {
+        return {Text("GPS no fix"), Text("%u satellites", p->satellites)};
+    }
+    return {Text("LiDAR: no return"), Text("strength %u", std::get<NoReturn>(problem).strength)};
+}
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+
+rtos::Latest<gps::Solution> g_gps{"GPS"};
+rtos::Latest<Orientation> g_imu{"IMU"};
+rtos::Latest<tf03::Measurement> g_lidar{"LiDAR"};
 
 /// A located target, and what it was located from.
 struct Sighting {
@@ -115,124 +144,279 @@ struct Sighting {
     geo::Position origin;
     geo::Aim aim;
     float range_m;
+    /// Set when the origin is @ref ping::kFallbackPosition, saying why the GPS
+    /// position was not used.
+    std::optional<Problem> fallback_because;
     /// The GPS's 1σ estimate of its horizontal error, metres.
     float origin_accuracy_m;
     std::uint8_t satellites;
-    /// The IMU's estimate of its heading error, degrees.
     float heading_accuracy_deg;
-    /// How far the IMU trusts its magnetometer calibration.
-    BNO08xAccuracy compass;
-
-    [[nodiscard]] std::string describe() const
-    {
-        return format("%.7f, %.7f, alt %.1f m"
-                      " | range %.2f m, bearing %.1f deg, elevation %.1f deg"
-                      " | from %.7f, %.7f, alt %.1f m, +/-%.1f m, %u satellites"
-                      " | heading +/-%.1f deg, compass calibration %s",
-                      target.latitude_deg, target.longitude_deg, target.altitude_m, range_m, aim.azimuth_deg,
-                      aim.elevation_deg, origin.latitude_deg, origin.longitude_deg, origin.altitude_m,
-                      origin_accuracy_m, satellites, heading_accuracy_deg, imu::to_string(compass));
-    }
+    geo::Accuracy compass;
 };
 
-/// Locates what the LiDAR is pointing at, from the latest sensor readings.
-std::expected<Sighting, Problem> take_sighting()
-{
-    const auto solution = g_gps.get(kMaxGpsAgeMs);
-    if (!solution) {
-        return std::unexpected(solution.error());
-    }
-    const auto orientation = g_imu.get(kMaxImuAgeMs);
-    if (!orientation) {
-        return std::unexpected(orientation.error());
-    }
-    const auto measurement = g_lidar.get(kMaxLidarAgeMs);
-    if (!measurement) {
-        return std::unexpected(measurement.error());
-    }
+struct Press {
+    std::uint32_t number;
+    std::optional<Sighting> sighting;
+    /// Why there is no sighting, when there is none.
+    std::optional<Problem> problem;
+};
+rtos::Latest<Press> g_target{"target"};
 
-    if (!solution->has_position()) {
-        return std::unexpected(format("GPS has no usable fix (%s, %u satellites)", gps::to_string(solution->fix_type),
-                                      solution->satellites));
+template <typename T>
+std::optional<T> fresh(rtos::Latest<T>& slot, std::uint32_t max_age_ms, std::optional<Problem>& problem)
+{
+    rtos::Age age;
+    auto reading = slot.get(max_age_ms, &age);
+    if (!reading && !problem) {
+        problem = Stale{.sensor = slot.sensor(), .age = age};
+    }
+    return reading;
+}
+
+/// Locates what the LiDAR is pointing at, from the latest sensor readings.
+Press take_sighting(std::uint32_t number)
+{
+    Press press{.number = number, .sighting = std::nullopt, .problem = std::nullopt};
+
+    const auto orientation = fresh(g_imu, kMaxImuAgeMs, press.problem);
+    const auto measurement = fresh(g_lidar, kMaxLidarAgeMs, press.problem);
+    if (!orientation || !measurement) {
+        return press;
     }
     if (!measurement->distance_cm) {
-        return std::unexpected(format("LiDAR has no return it trusts (strength %u)", measurement->strength));
+        press.problem = NoReturn{.strength = measurement->strength};
+        return press;
     }
 
-    const geo::Position origin{
-        .latitude_deg = solution->latitude_deg,
-        .longitude_deg = solution->longitude_deg,
-        .altitude_m = solution->height_msl_m,
-    };
-    const geo::Aim aim = geo::Aim::from_orientation(orientation->quaternion, kLidarBoresight, kMagneticDeclinationDeg);
-    const float range_m = static_cast<float>(*measurement->distance_cm) / 100.0F;
+    std::optional<Problem> gps_problem;
+    std::optional<geo::Position> origin;
+    float accuracy_m = 0.0F;
+    std::uint8_t satellites = 0;
+    if (const auto solution = fresh(g_gps, kMaxGpsAgeMs, gps_problem)) {
+        if (solution->has_position()) {
+            origin = geo::Position{
+                .latitude_deg = solution->latitude_deg,
+                .longitude_deg = solution->longitude_deg,
+                .altitude_m = static_cast<double>(solution->height_msl_m),
+            };
+            accuracy_m = solution->horizontal_accuracy_m;
+            satellites = solution->satellites;
+        } else {
+            gps_problem = NoFix{.fix_type = solution->fix_type, .satellites = solution->satellites};
+        }
+    }
+    std::optional<Problem> fallback_because;
+    if (!origin) {
+        if (!kFallbackPosition) {
+            press.problem = gps_problem;
+            return press;
+        }
+        origin = kFallbackPosition;
+        fallback_because = gps_problem;
+    }
 
-    return Sighting{
-        .target = origin.project(aim, range_m),
-        .origin = origin,
+    const geo::Aim aim = orientation->aim();
+    const float range_m = static_cast<float>(*measurement->distance_cm) / 100.0F;
+    press.sighting = Sighting{
+        .target = origin->project(aim, range_m),
+        .origin = *origin,
         .aim = aim,
         .range_m = range_m,
-        .origin_accuracy_m = solution->horizontal_accuracy_m,
-        .satellites = solution->satellites,
-        .heading_accuracy_deg = orientation->heading_accuracy_rad * (180.0F / std::numbers::pi_v<float>),
+        .fallback_because = fallback_because,
+        .origin_accuracy_m = accuracy_m,
+        .satellites = satellites,
+        .heading_accuracy_deg = orientation->heading_accuracy_rad * kDegPerRad,
         .compass = orientation->calibration,
     };
+    return press;
+}
+
+void print_press(const Press& press)
+{
+    if (!press.sighting) {
+        std::printf("target #%" PRIu32 ": none, %s\n", press.number, describe(*press.problem).c_str());
+        std::fflush(stdout);
+        return;
+    }
+    const Sighting& s = *press.sighting;
+    const Text source = s.fallback_because ? Text("FALLBACK POSITION, %s", describe(*s.fallback_because).c_str())
+                                           : Text("+/-%.1f m, %u satellites", static_cast<double>(s.origin_accuracy_m),
+                                                  s.satellites);
+    std::printf("target #%" PRIu32 ": %.7f, %.7f, alt %.1f m"
+                " | range %.2f m, bearing %.1f deg, elevation %.1f deg"
+                " | from %.7f, %.7f, alt %.1f m, %s"
+                " | heading +/-%.1f deg, compass calibration %s\n",
+                press.number, s.target.latitude_deg, s.target.longitude_deg, s.target.altitude_m,
+                static_cast<double>(s.range_m), static_cast<double>(s.aim.azimuth_deg),
+                static_cast<double>(s.aim.elevation_deg), s.origin.latitude_deg, s.origin.longitude_deg,
+                s.origin.altitude_m, source.c_str(), static_cast<double>(s.heading_accuracy_deg),
+                geo::to_string(s.compass));
+    std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// Sensor tasks
+// ---------------------------------------------------------------------------
+
+void log_gps(const gps::Solution& solution)
+{
+    if (solution.has_position()) {
+        ESP_LOGI(kTag, "GPS: %s, %u satellites, %.7f, %.7f +/-%.1f m", gps::to_string(solution.fix_type),
+                 solution.satellites, solution.latitude_deg, solution.longitude_deg,
+                 static_cast<double>(solution.horizontal_accuracy_m));
+    } else {
+        ESP_LOGI(kTag, "GPS: no fix yet (%s)", gps::to_string(solution.fix_type));
+    }
 }
 
 /// Keeps the latest navigation solution from the NEO-M9N.
 void gps_task(void* /*arg*/)
 {
+    const rtos::Watchdog watchdog;
     static gps::Gps gps{kGpsUart};
-    ESP_ERROR_CHECK(gps.begin(kGpsTx, kGpsRx, kGpsBaudRate));
+    while (esp_err_t err = gps.begin(kGpsTx, kGpsRx, kGpsBaudRate)) {
+        ESP_LOGE(kTag, "GPS UART setup failed: %s, retrying", esp_err_to_name(err));
+        watchdog.feed();
+        delay_ms(kRetryDelayMs);
+    }
 
+    std::int64_t next_log = 0;
     for (;;) {
-        // The configuration lives in the receiver's RAM, so this runs again
-        // whenever the receiver goes quiet, in case a power glitch has put it
-        // back to its factory NMEA output.
-        while (!gps.configure(kGpsRateHz)) {
-            ESP_LOGW(kTag, "GPS configuration failed, retrying");
-            vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+        // The configuration survives a restart only while the receiver's
+        // backup supply holds, so this runs again whenever it goes quiet.
+        for (;;) {
+            watchdog.feed();
+            const auto version = gps.configure(kGpsRateHz);
+            if (version) {
+                break;
+            }
+            ESP_LOGW(kTag, "GPS configuration failed: %s, retrying", gps::to_string(version.error()));
+            delay_ms(kRetryDelayMs);
         }
         ESP_LOGI(kTag, "GPS up: %u solutions a second", kGpsRateHz);
 
         std::int64_t last = now_ms();
         for (;;) {
-            if (auto solution = gps.poll()) {
+            watchdog.feed();
+            const auto solution = gps.read(kGpsSilenceMs);
+            if (solution) {
                 g_gps.set(*solution);
                 last = now_ms();
-            } else if (now_ms() - last > kGpsSilenceMs) {
-                ESP_LOGW(kTag, "GPS went quiet, configuring it again");
-                break;
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(10));
+                if (now_ms() >= next_log) {
+                    next_log = now_ms() + kGpsLogIntervalMs;
+                    log_gps(*solution);
+                }
+                continue;
             }
+            if (now_ms() - last >= kGpsSilenceMs) {
+                ESP_LOGW(kTag, "GPS went quiet (%s), configuring it again", gps::to_string(solution.error()));
+                break;
+            }
+            // Typically an RX overflow; the parser resynchronises on the next
+            // frame, so carry on reading.
+            ESP_LOGW(kTag, "GPS read failed: %s", gps::to_string(solution.error()));
         }
     }
+}
+
+void log_compass(const Orientation& orientation)
+{
+    const geo::Aim aim = orientation.aim();
+    ESP_LOGI(kTag, "Compass: bearing %.1f deg, elevation %.1f deg, heading +/-%.1f deg, calibration %s%s",
+             static_cast<double>(aim.azimuth_deg), static_cast<double>(aim.elevation_deg),
+             static_cast<double>(orientation.heading_accuracy_rad * kDegPerRad), geo::to_string(orientation.calibration),
+             orientation.calibration == geo::Accuracy::kHigh
+                 ? ""
+                 : " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)");
+}
+
+/// Resets the hub and starts the reports the compass is built from.
+std::expected<imu::ProductId, imu::Error> start_imu(imu::Imu& imu)
+{
+    auto id = imu.start();
+    if (!id) {
+        return id;
+    }
+    // `imu_cal` calibrates the magnetometer; the hub keeps calibrating only
+    // what the game rotation vector relies on.
+    if (auto r = imu.configure_calibration(true, false, false); !r) {
+        return std::unexpected(r.error());
+    }
+    if (auto r = imu.enable_report(imu::SensorId::kGameRotationVector, kImuReportIntervalUs); !r) {
+        return std::unexpected(r.error());
+    }
+    if (auto r = imu.enable_report(imu::SensorId::kMagneticFieldUncalibrated, kMagReportIntervalUs); !r) {
+        return std::unexpected(r.error());
+    }
+    return id;
 }
 
 /// Keeps the latest orientation from the BNO085.
 void imu_task(void* /*arg*/)
 {
+    const rtos::Watchdog watchdog;
     static imu::Imu imu;
 
     for (;;) {
-        if (!imu.start(kImuReportIntervalUs)) {
-            ESP_LOGW(kTag, "BNO085 bring-up failed, retrying");
-            vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+        watchdog.feed();
+        const auto id = start_imu(imu);
+        if (!id) {
+            ESP_LOGW(kTag, "BNO085 bring-up failed: %s, retrying", imu::to_string(id.error()));
+            delay_ms(kRetryDelayMs);
             continue;
         }
-        const sh2_ProductId_t id = imu.product_id();
-        ESP_LOGI(kTag, "BNO085 up: firmware %u.%u.%u, reset cause %u", id.swVersionMajor, id.swVersionMinor,
-                 id.swVersionPatch, id.resetCause);
+        ESP_LOGI(kTag, "BNO085 up: firmware %u.%u.%u, reset cause %u", id->sw_major, id->sw_minor, id->sw_patch,
+                 id->reset_cause);
 
+        // The game rotation vector's frame starts over with the hub.
+        mag_cal::Compass compass{kMagCalibration};
+        mag_cal::StartupCalibration startup{kMagCalibration ? std::optional(kMagCalibration->matrix) : std::nullopt};
+        std::int64_t next_log = 0;
         std::int64_t last = now_ms();
+
         for (;;) {
-            if (auto orientation = imu.wait()) {
-                g_imu.set(*orientation);
-                last = now_ms();
-            } else if (now_ms() - last > kImuSilenceMs) {
-                ESP_LOGW(kTag, "BNO085 went quiet, starting it again");
+            watchdog.feed();
+            const auto event = imu.next(kImuSilenceMs);
+            if (!event) {
+                ESP_LOGW(kTag, "BNO085 failed: %s, starting it again", imu::to_string(event.error()));
                 break;
+            }
+            if (!*event) {
+                if (now_ms() - last >= kImuSilenceMs) {
+                    ESP_LOGW(kTag, "BNO085 went quiet, starting it again");
+                    break;
+                }
+                continue;
+            }
+            last = now_ms();
+            const imu::Event& e = **event;
+            if (e.sensor == imu::SensorId::kMagneticFieldUncalibrated) {
+                compass.update_field(e.vector);
+                if (const auto found = startup.add(e.vector)) {
+                    ESP_LOGI(kTag,
+                             "Compass calibrated from handling: hard iron %.1f %.1f %.1f uT, field %.1f uT, "
+                             "residual %.4f",
+                             static_cast<double>(found->offset[0]), static_cast<double>(found->offset[1]),
+                             static_cast<double>(found->offset[2]), static_cast<double>(found->field_ut),
+                             static_cast<double>(found->residual));
+                    compass.set_calibration(*found);
+                }
+            } else if (e.sensor == imu::SensorId::kGameRotationVector) {
+                compass.update_game(e.quaternion);
+                const auto heading = compass.heading();
+                if (!heading) {
+                    continue;
+                }
+                const Orientation orientation{
+                    .quaternion = heading->quaternion,
+                    .heading_accuracy_rad = heading->accuracy_rad,
+                    .calibration = heading->status,
+                };
+                g_imu.set(orientation);
+                if (now_ms() >= next_log) {
+                    next_log = now_ms() + kCompassLogIntervalMs;
+                    log_compass(orientation);
+                }
             }
         }
     }
@@ -241,8 +425,13 @@ void imu_task(void* /*arg*/)
 /// Keeps the latest distance from the TF03.
 void lidar_task(void* /*arg*/)
 {
+    const rtos::Watchdog watchdog;
     static tf03::Tf03 lidar{kLidarUart};
-    ESP_ERROR_CHECK(lidar.begin(kLidarTx, kLidarRx, kLidarBaudRate));
+    while (esp_err_t err = lidar.begin(kLidarTx, kLidarRx, kLidarBaudRate)) {
+        ESP_LOGE(kTag, "LiDAR UART setup failed: %s, retrying", esp_err_to_name(err));
+        watchdog.feed();
+        delay_ms(kRetryDelayMs);
+    }
 
     // The TF03 streams measurements unasked, so distances need only its TxD
     // wire. Answering a command also needs its RxD wire, so the firmware
@@ -256,6 +445,7 @@ void lidar_task(void* /*arg*/)
     }
 
     for (;;) {
+        watchdog.feed();
         if (auto measurement = lidar.read(kLidarSilenceMs)) {
             g_lidar.set(*measurement);
         } else {
@@ -264,6 +454,96 @@ void lidar_task(void* /*arg*/)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+/// The nearest of the sixteen compass points to `bearing_deg`.
+const char* compass_point(float bearing_deg)
+{
+    static constexpr const char* kPoints[16] = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                                                "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
+    // Each point covers 22.5°, centred on its own bearing.
+    return kPoints[static_cast<unsigned>(bearing_deg / 22.5F + 0.5F) % 16];
+}
+
+/// Shows the latest press for @ref ping::kTargetHoldMs after it, otherwise
+/// the live readings.
+void refresh(Display& lcd)
+{
+    if (const auto press = g_target.get(kTargetHoldMs)) {
+        if (press->sighting) {
+            const Sighting& s = *press->sighting;
+            lcd.show({s.fallback_because ? Text("#%" PRIu32 " test origin", press->number)
+                                         : Text("#%" PRIu32 " target", press->number),
+                      Text("%c %.6f", s.target.latitude_deg < 0 ? 'S' : 'N', std::abs(s.target.latitude_deg)),
+                      Text("%c %.6f", s.target.longitude_deg < 0 ? 'W' : 'E', std::abs(s.target.longitude_deg)),
+                      Text("%.1fm @ %.0f°", static_cast<double>(s.range_m), static_cast<double>(s.aim.azimuth_deg))},
+                     false);
+        } else {
+            const auto [why, detail] = explain(*press->problem);
+            lcd.show({Text("#%" PRIu32 " no target", press->number), why, detail}, false);
+        }
+        return;
+    }
+
+    std::optional<Problem> imu_problem;
+    std::pair<Text, Text> heading{Text(""), Text("")};
+    if (const auto orientation = fresh(g_imu, kMaxImuAgeMs, imu_problem)) {
+        const geo::Aim aim = orientation->aim();
+        heading.first = Text("hdg %.1f° %s", static_cast<double>(aim.azimuth_deg), compass_point(aim.azimuth_deg));
+        switch (orientation->calibration) {
+        case geo::Accuracy::kHigh:
+            heading.second =
+                Text("cal high ±%.0f°", static_cast<double>(orientation->heading_accuracy_rad * kDegPerRad));
+            break;
+        case geo::Accuracy::kMedium:
+            heading.second = Text("cal med");
+            break;
+        case geo::Accuracy::kLow:
+            heading.second = Text("cal low");
+            break;
+        case geo::Accuracy::kUnreliable:
+            heading.second = Text("cal bad - move");
+            break;
+        }
+    } else {
+        heading = explain(*imu_problem);
+    }
+
+    std::optional<Problem> ignored;
+    Text range("LiDAR silent");
+    if (const auto m = fresh(g_lidar, kMaxLidarAgeMs, ignored)) {
+        range = m->distance_cm ? Text("rng %.2f m", static_cast<double>(*m->distance_cm) / 100.0)
+                               : Text("rng: no return");
+    }
+    Text gps("GPS silent");
+    if (const auto s = fresh(g_gps, kMaxGpsAgeMs, ignored)) {
+        gps = Text("GPS %s %usat", gps::to_string(s->fix_type), s->satellites);
+    }
+    lcd.show({heading.first, heading.second, range, gps}, false);
+}
+
+/// Keeps the display up to date. @ref Display::show brings a missing or
+/// unplugged display back by itself, so this only paces it.
+void display_task(void* /*arg*/)
+{
+    static Display lcd;
+    while (esp_err_t err = lcd.begin()) {
+        ESP_LOGE(kTag, "display I2C setup failed: %s, retrying", esp_err_to_name(err));
+        delay_ms(kRetryDelayMs);
+    }
+    for (;;) {
+        refresh(lcd);
+        // A missing display is retried less often.
+        delay_ms(lcd.ready() ? kLcdRefreshMs : kRetryDelayMs);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Button
+// ---------------------------------------------------------------------------
+
 bool button_down() { return gpio_get_level(kButton) == 0; }
 
 /// Waits for the button to be let go and to stay up past any contact bounce.
@@ -271,9 +551,9 @@ void wait_for_release()
 {
     for (;;) {
         while (button_down()) {
-            vTaskDelay(pdMS_TO_TICKS(kButtonPollMs));
+            delay_ms(kButtonPollMs);
         }
-        vTaskDelay(pdMS_TO_TICKS(kDebounceMs));
+        delay_ms(kDebounceMs);
         if (!button_down()) {
             return;
         }
@@ -284,37 +564,40 @@ void wait_for_release()
 
 extern "C" void app_main()
 {
-    // Trigger button, wired from its GPIO to ground.
+    // Polled rather than edge-triggered: no ISR to share with the IMU's INT
+    // handler, and 5 ms is far inside a press.
     gpio_config_t button{};
     button.pin_bit_mask = 1ULL << kButton;
     button.mode = GPIO_MODE_INPUT;
     button.pull_up_en = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK(gpio_config(&button));
 
-    xTaskCreate(gps_task, "gps", kSensorStack, nullptr, 5, nullptr);
-    xTaskCreate(imu_task, "imu", kSensorStack, nullptr, 5, nullptr);
-    xTaskCreate(lidar_task, "lidar", kSensorStack, nullptr, 5, nullptr);
+    // Without its tasks the device cannot work at all, so a failure here
+    // (out of memory at boot) restarts the chip rather than limping on.
+    if (!rtos::spawn(gps_task, "gps", kTaskStack, kSensorPriority) ||
+        !rtos::spawn(imu_task, "imu", kTaskStack, kSensorPriority) ||
+        !rtos::spawn(lidar_task, "lidar", kTaskStack, kSensorPriority) ||
+        !rtos::spawn(display_task, "display", kTaskStack, kDisplayPriority)) {
+        esp_restart();
+    }
 
     std::uint32_t presses = 0;
     for (;;) {
         while (!button_down()) {
-            vTaskDelay(pdMS_TO_TICKS(kButtonPollMs));
+            delay_ms(kButtonPollMs);
         }
         // Take the readings from when the button went down, before pressing
         // it has had time to jog where the device points.
-        const auto sighting = take_sighting();
-        vTaskDelay(pdMS_TO_TICKS(kDebounceMs));
+        const Press press = take_sighting(presses + 1);
+        delay_ms(kDebounceMs);
         if (!button_down()) {
             // Too short to be a press: noise, or contacts bouncing.
             continue;
         }
 
         ++presses;
-        if (sighting) {
-            std::printf("target #%lu: %s\n", static_cast<unsigned long>(presses), sighting->describe().c_str());
-        } else {
-            std::printf("target #%lu: none, %s\n", static_cast<unsigned long>(presses), sighting.error().c_str());
-        }
+        g_target.set(press);
+        print_press(press);
 
         // One coordinate per press, however long the button is held.
         wait_for_release();

@@ -106,10 +106,14 @@ class Display {
     /// text past the right edge is cut off.
     esp_err_t write_line(std::size_t row, const char* text);
 
-    /// Shows `lines` one per row, blanking the rows below them, and logs
-    /// them on one line. A failed display write is logged once and otherwise
-    /// ignored, so a loose display never stops a sensor being read.
-    void show(std::initializer_list<Text> lines);
+    /// Shows `lines` one per row, blanking the rows below them, and with
+    /// `log` also logs them on one line. A failed display write is logged
+    /// once and otherwise ignored, and the next call tries to bring the
+    /// display back, so a loose display never stops a sensor being read.
+    void show(std::initializer_list<Text> lines, bool log = true);
+
+    /// Whether the last @ref init or @ref show reached the display.
+    [[nodiscard]] bool ready() const { return ready_; }
 
     /// Asks every ordinary I²C address in turn whether anything is there.
     ///

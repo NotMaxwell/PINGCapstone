@@ -1,40 +1,57 @@
 #include "ping/gps.hpp"
 
+#include <esp_log.h>
+#include <esp_timer.h>
+
+#include <algorithm>
+#include <optional>
+
 namespace ping::gps {
 namespace {
 
-/// Room the ESP-IDF driver keeps for received bytes between reads; SparkFun
-/// asks for at least 1 KiB.
+constexpr const char* kTag = "gps";
+
+/// Room the driver keeps for received bytes between reads: about half a
+/// second of the receiver's full output at 38400 baud.
 constexpr int kRxRingBuffer = 2048;
+
+/// Deep enough that overflow events are not pushed out by data events while
+/// the caller is busy elsewhere; the driver drops events when it is full.
+constexpr int kEventQueueDepth = 64;
 
 /// How long the receiver may take to answer a poll or acknowledge a
 /// configuration. u-blox answers within a navigation epoch; one second covers
 /// the slowest rate this configures.
-constexpr std::uint16_t kResponseTimeoutMs = 1'000;
+constexpr std::int64_t kResponseTimeoutUs = 1'000'000;
+
+constexpr std::uint32_t kTxDoneTimeoutMs = 100;
 
 } // namespace
 
-const char* to_string(FixType fix)
+const char* to_string(Error error)
 {
-    switch (fix) {
-    case FixType::kNoFix:
-        return "no fix";
-    case FixType::kDeadReckoningOnly:
-        return "dead reckoning";
-    case FixType::kFix2D:
-        return "2D";
-    case FixType::kFix3D:
-        return "3D";
-    case FixType::kGnssPlusDeadReckoning:
-        return "GNSS+DR";
-    case FixType::kTimeOnly:
-        return "time only";
+    switch (error) {
+    case Error::kNotStarted:
+        return "not started";
+    case Error::kUart:
+        return "uart error";
+    case Error::kTimeout:
+        return "timeout";
+    case Error::kRejected:
+        return "rejected";
+    case Error::kUnsupported:
+        return "unsupported";
+    case Error::kOverflow:
+        return "overflow";
     }
     return "?";
 }
 
 esp_err_t Gps::begin(gpio_num_t tx, gpio_num_t rx, int baud)
 {
+    if (started_) {
+        return ESP_ERR_INVALID_STATE;
+    }
     uart_config_t config{};
     config.baud_rate = baud;
     config.data_bits = UART_DATA_8_BITS;
@@ -42,111 +59,182 @@ esp_err_t Gps::begin(gpio_num_t tx, gpio_num_t rx, int baud)
     config.stop_bits = UART_STOP_BITS_1;
     config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     config.source_clk = UART_SCLK_DEFAULT;
-    if (esp_err_t err = uart_driver_install(port_, kRxRingBuffer, 0, 0, nullptr, 0); err != ESP_OK) {
+
+    esp_err_t err = uart_driver_install(port_, kRxRingBuffer, 0, kEventQueueDepth, &events_, 0);
+    if (err != ESP_OK) {
+        events_ = nullptr;
         return err;
     }
-    if (esp_err_t err = uart_param_config(port_, &config); err != ESP_OK) {
+    err = uart_param_config(port_, &config);
+    if (err == ESP_OK) {
+        err = uart_set_pin(port_, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    }
+    if (err != ESP_OK) {
+        // Leave the port free for a retry.
+        if (const esp_err_t del = uart_driver_delete(port_); del != ESP_OK) {
+            ESP_LOGE(kTag, "uart_driver_delete: %s", esp_err_to_name(del));
+        }
+        events_ = nullptr;
         return err;
     }
-    return uart_set_pin(port_, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    parser_.reset();
+    rx_pos_ = rx_len_ = 0;
+    started_ = true;
+    return ESP_OK;
 }
 
-std::optional<Version> Gps::connect()
+bool Gps::handle_events()
 {
-    if (!started_) {
-        started_ = gnss_.begin(port_, kResponseTimeoutMs);
-        if (!started_) {
-            return std::nullopt;
+    bool lost = false;
+    uart_event_t event;
+    while (xQueueReceive(events_, &event, 0) == pdTRUE) {
+        if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
+            lost = true;
         }
     }
-    if (!gnss_.getModuleInfo(kResponseTimeoutMs)) {
-        return std::nullopt;
+    if (lost) {
+        if (const esp_err_t err = uart_flush_input(port_); err != ESP_OK) {
+            ESP_LOGE(kTag, "uart_flush_input: %s", esp_err_to_name(err));
+        }
+        // A partial frame would be spliced onto an unrelated later one.
+        parser_.reset();
+        rx_pos_ = rx_len_ = 0;
+        // Flushing can race with bytes still arriving; the stale events are
+        // gone with the queue drain above.
+        ESP_LOGW(kTag, "receive overflow, input flushed");
     }
-    return Version{
-        .module = gnss_.getModuleName(),
-        .firmware_type = gnss_.getFirmwareType(),
-        .firmware_major = gnss_.getFirmwareVersionHigh(),
-        .firmware_minor = gnss_.getFirmwareVersionLow(),
-        .protocol_major = gnss_.getProtocolVersionHigh(),
-        .protocol_minor = gnss_.getProtocolVersionLow(),
-    };
+    return lost;
 }
 
-bool Gps::configure(std::uint8_t rate_hz)
+Gps::Wait Gps::next_frame(std::int64_t deadline_us, ubx::Frame& out)
 {
-    if (rate_hz < 1 || rate_hz > kMaxNavRateHz) {
-        return false;
+    if (const auto frame = parser_.poll()) {
+        out = *frame;
+        return Wait::kFrame;
     }
-    if (!started_ && !connect()) {
-        return false;
-    }
+    for (;;) {
+        while (rx_pos_ < rx_len_) {
+            if (const auto frame = parser_.push(rx_[rx_pos_++])) {
+                out = *frame;
+                return Wait::kFrame;
+            }
+        }
+        if (handle_events()) {
+            return Wait::kOverflow;
+        }
 
-    // One CFG-VALSET to the RAM layer: UBX in and out on UART1, NMEA off, and
-    // a measurement every 1000 / rate_hz ms with a solution from each.
-    gnss_.newCfgValset(VAL_LAYER_RAM);
-    gnss_.addCfgValset(UBLOX_CFG_UART1INPROT_UBX, std::uint8_t{1});
-    gnss_.addCfgValset(UBLOX_CFG_UART1OUTPROT_UBX, std::uint8_t{1});
-    gnss_.addCfgValset(UBLOX_CFG_UART1OUTPROT_NMEA, std::uint8_t{0});
-    gnss_.addCfgValset(UBLOX_CFG_RATE_MEAS, static_cast<std::uint16_t>(1000 / rate_hz));
-    gnss_.addCfgValset(UBLOX_CFG_RATE_NAV, std::uint16_t{1});
-    if (!gnss_.sendCfgValset(kResponseTimeoutMs)) {
-        return false;
+        const std::int64_t remaining_us = deadline_us - esp_timer_get_time();
+        const std::uint32_t remaining_ms = remaining_us > 0 ? static_cast<std::uint32_t>((remaining_us + 999) / 1000) : 0;
+        const int n = uart_read_bytes(port_, rx_.data(), static_cast<std::uint32_t>(rx_.size()),
+                                      pdMS_TO_TICKS(remaining_ms));
+        if (n < 0) {
+            ESP_LOGE(kTag, "uart_read_bytes failed");
+            return Wait::kUartError;
+        }
+        if (n == 0) {
+            if (remaining_ms == 0 || esp_timer_get_time() >= deadline_us) {
+                return Wait::kTimeout;
+            }
+            continue;
+        }
+        rx_pos_ = 0;
+        rx_len_ = static_cast<std::size_t>(n);
     }
-
-    // One NAV-PVT per solution, pushed rather than polled, and not consumed
-    // implicitly by the getters: poll() reports each one once.
-    return gnss_.setAutoUBX("NAV", "PVT", true, false, VAL_LAYER_RAM, kResponseTimeoutMs);
 }
 
-std::optional<Solution> Gps::poll()
+bool Gps::send(std::span<const std::uint8_t> bytes)
 {
-    // With NAV-PVT pushed, this only reads what has already arrived on the
-    // UART and reports whether it completed a fresh solution.
-    if (!gnss_.getNAVPVT(0)) {
-        return std::nullopt;
+    const int written = uart_write_bytes(port_, bytes.data(), bytes.size());
+    if (written < 0 || static_cast<std::size_t>(written) != bytes.size()) {
+        ESP_LOGE(kTag, "uart_write_bytes wrote %d of %u", written, static_cast<unsigned>(bytes.size()));
+        return false;
+    }
+    if (const esp_err_t err = uart_wait_tx_done(port_, pdMS_TO_TICKS(kTxDoneTimeoutMs)); err != ESP_OK) {
+        ESP_LOGE(kTag, "uart_wait_tx_done: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+std::expected<Version, Error> Gps::configure(std::uint8_t rate_hz)
+{
+    if (!started_) {
+        return std::unexpected(Error::kNotStarted);
+    }
+    const auto config = ubx::build_configure(rate_hz);
+    if (!config) {
+        return std::unexpected(Error::kUnsupported);
     }
 
-    std::optional<UtcTime> utc;
-    if (gnss_.getDateValid() && gnss_.getTimeValid() && gnss_.getTimeFullyResolved()) {
-        utc = UtcTime{
-            .year = gnss_.getYear(),
-            .month = gnss_.getMonth(),
-            .day = gnss_.getDay(),
-            .hour = gnss_.getHour(),
-            .minute = gnss_.getMinute(),
-            .second = gnss_.getSecond(),
-            .nanosecond = gnss_.getNanosecond(),
-        };
+    if (!send(config->view())) {
+        return std::unexpected(Error::kUart);
+    }
+    ubx::Frame frame{};
+    const std::int64_t ack_deadline = esp_timer_get_time() + kResponseTimeoutUs;
+    for (bool acknowledged = false; !acknowledged;) {
+        switch (next_frame(ack_deadline, frame)) {
+        case Wait::kFrame:
+            if (const auto ack = ubx::decode_ack(frame);
+                ack && ack->cls == ubx::kClassCfg && ack->id == ubx::kIdCfgValset) {
+                if (!ack->accepted) {
+                    return std::unexpected(Error::kRejected);
+                }
+                acknowledged = true;
+            }
+            break;
+        case Wait::kOverflow:
+            break;
+        case Wait::kTimeout:
+            return std::unexpected(Error::kTimeout);
+        case Wait::kUartError:
+            return std::unexpected(Error::kUart);
+        }
     }
 
-    const std::uint8_t fix = gnss_.getFixType();
-    return Solution{
-        .itow_ms = gnss_.getTimeOfWeek(),
-        // Values 6-255 are reserved; no solution worth using carries one.
-        .fix_type = fix <= 5 ? static_cast<FixType>(fix) : FixType::kNoFix,
-        .fix_ok = gnss_.getGnssFixOk(),
-        .differential = gnss_.getDiffSoln(),
-        .satellites = gnss_.getSIV(),
-        .latitude_deg = gnss_.getLatitude() * 1e-7,
-        .longitude_deg = gnss_.getLongitude() * 1e-7,
-        .height_ellipsoid_m = static_cast<float>(gnss_.getAltitude()) * 1e-3F,
-        .height_msl_m = static_cast<float>(gnss_.getAltitudeMSL()) * 1e-3F,
-        .horizontal_accuracy_m = static_cast<float>(gnss_.getHorizontalAccEst()) * 1e-3F,
-        .vertical_accuracy_m = static_cast<float>(gnss_.getVerticalAccEst()) * 1e-3F,
-        .velocity_ned_mps =
-            {
-                static_cast<float>(gnss_.getNedNorthVel()) * 1e-3F,
-                static_cast<float>(gnss_.getNedEastVel()) * 1e-3F,
-                static_cast<float>(gnss_.getNedDownVel()) * 1e-3F,
-            },
-        .ground_speed_mps = static_cast<float>(gnss_.getGroundSpeed()) * 1e-3F,
-        .speed_accuracy_mps = static_cast<float>(gnss_.getSpeedAccEst()) * 1e-3F,
-        .heading_of_motion_deg = static_cast<float>(gnss_.getHeading()) * 1e-5F,
-        .heading_accuracy_deg = static_cast<float>(gnss_.getHeadingAccEst()) * 1e-5F,
-        .pdop = static_cast<float>(gnss_.getPDOP()) * 1e-2F,
-        .utc = utc,
-        .invalid_position = gnss_.getInvalidLlh(),
-    };
+    const auto poll = ubx::build_poll_mon_ver();
+    if (!send(poll.view())) {
+        return std::unexpected(Error::kUart);
+    }
+    const std::int64_t version_deadline = esp_timer_get_time() + kResponseTimeoutUs;
+    for (;;) {
+        switch (next_frame(version_deadline, frame)) {
+        case Wait::kFrame:
+            if (const auto version = ubx::decode_mon_ver(frame)) {
+                return *version;
+            }
+            continue;
+        case Wait::kOverflow:
+            continue;
+        case Wait::kTimeout:
+            return std::unexpected(Error::kTimeout);
+        case Wait::kUartError:
+            return std::unexpected(Error::kUart);
+        }
+    }
+}
+
+std::expected<Solution, Error> Gps::read(std::uint32_t timeout_ms)
+{
+    if (!started_) {
+        return std::unexpected(Error::kNotStarted);
+    }
+    const std::int64_t deadline = esp_timer_get_time() + static_cast<std::int64_t>(timeout_ms) * 1000;
+    ubx::Frame frame{};
+    for (;;) {
+        switch (next_frame(deadline, frame)) {
+        case Wait::kFrame:
+            if (const auto solution = ubx::decode_nav_pvt(frame)) {
+                return *solution;
+            }
+            continue;
+        case Wait::kOverflow:
+            return std::unexpected(Error::kOverflow);
+        case Wait::kTimeout:
+            return std::unexpected(Error::kTimeout);
+        case Wait::kUartError:
+            return std::unexpected(Error::kUart);
+        }
+    }
 }
 
 } // namespace ping::gps

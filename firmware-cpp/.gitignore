@@ -1,9 +1,12 @@
-# ESP-IDF build output, per-application build directories and the host tests.
+# Every preset's build directory, including the host tests.
 build/
 # Fetched by the component manager from components/ping/idf_component.yml;
 # dependencies.lock pins what was fetched and is committed.
 managed_components/
-# Generated from sdkconfig.defaults on the first build.
+# Each preset writes its own sdkconfig into its build directory; these appear
+# only when idf.py runs without a preset.
 sdkconfig
 sdkconfig.old
 .cache/
+.scratch/
+CMakeUserPresets.json

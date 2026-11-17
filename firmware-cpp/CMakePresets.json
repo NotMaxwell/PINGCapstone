@@ -1,0 +1,148 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Firmware: main program (esp-clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/main",
+      "cacheVariables": {
+        "PING_APP": "main",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/main/sdkconfig"
+      }
+    },
+    {
+      "name": "gps_demo",
+      "displayName": "Firmware: gps_demo (esp-clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/gps_demo",
+      "cacheVariables": {
+        "PING_APP": "gps_demo",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/gps_demo/sdkconfig"
+      }
+    },
+    {
+      "name": "imu_demo",
+      "displayName": "Firmware: imu_demo (esp-clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/imu_demo",
+      "cacheVariables": {
+        "PING_APP": "imu_demo",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/imu_demo/sdkconfig"
+      }
+    },
+    {
+      "name": "lidar_demo",
+      "displayName": "Firmware: lidar_demo (esp-clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/lidar_demo",
+      "cacheVariables": {
+        "PING_APP": "lidar_demo",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/lidar_demo/sdkconfig"
+      }
+    },
+    {
+      "name": "lcd_demo",
+      "displayName": "Firmware: lcd_demo (esp-clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/lcd_demo",
+      "cacheVariables": {
+        "PING_APP": "lcd_demo",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/lcd_demo/sdkconfig"
+      }
+    },
+    {
+      "name": "main-gcc",
+      "displayName": "Firmware: main program (GCC, fallback toolchain)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/main-gcc",
+      "cacheVariables": {
+        "PING_APP": "main",
+        "IDF_TOOLCHAIN": "gcc",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/main-gcc/sdkconfig"
+      }
+    },
+    {
+      "name": "main-debug",
+      "displayName": "Firmware: main program, debug build (esp-clang, -Og, GDB stub on panic)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/main-debug",
+      "cacheVariables": {
+        "PING_APP": "main",
+        "IDF_TOOLCHAIN": "clang",
+        "IDF_TARGET": "esp32s3",
+        "SDKCONFIG": "${sourceDir}/build/main-debug/sdkconfig",
+        "SDKCONFIG_DEFAULTS": "sdkconfig.defaults;sdkconfig.debug"
+      }
+    },
+    {
+      "name": "host",
+      "displayName": "Host tests (clang)",
+      "binaryDir": "${sourceDir}/build/host",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "PING_HOST_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "host-asan",
+      "displayName": "Host tests (clang, ASan + UBSan)",
+      "binaryDir": "${sourceDir}/build/host-asan",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "PING_HOST_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PING_SANITIZE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host"
+    },
+    {
+      "name": "host-asan",
+      "configurePreset": "host-asan"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "host",
+      "configurePreset": "host",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "host-asan",
+      "configurePreset": "host-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

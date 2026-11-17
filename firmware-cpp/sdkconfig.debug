@@ -1,0 +1,6 @@
+# Layered on sdkconfig.defaults by the *-debug presets (see BUILD.md):
+# optimisation that keeps variables visible in GDB, and a panic that waits
+# for the debugger instead of rebooting.
+CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
+CONFIG_ESP_SYSTEM_PANIC_GDBSTUB=y
+CONFIG_ESP_TASK_WDT_PANIC=n

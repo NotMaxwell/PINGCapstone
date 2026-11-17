@@ -24,3 +24,7 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# firmware-cpp ships its editor setup (clangd, VS Code tasks/debug, Neovim).
+!firmware-cpp/.vscode/
+!firmware-cpp/.nvim.lua

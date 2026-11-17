@@ -94,6 +94,16 @@ std::uint8_t Display::gpio_and_delay_cb(u8x8_t* /*u8x8*/, std::uint8_t msg, std:
 
 esp_err_t Display::init()
 {
+    if (bus_ == nullptr || device_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (failing_) {
+        // A display unplugged mid-transfer can leave SDA held low, and then
+        // every later transfer fails until the bus is clocked free.
+        if (esp_err_t err = i2c_master_bus_reset(bus_); err != ESP_OK) {
+            return err;
+        }
+    }
     if (kLcdController == LcdController::kSh1106) {
         u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2_, U8G2_R0, byte_cb, gpio_and_delay_cb);
     } else {
@@ -151,16 +161,18 @@ esp_err_t Display::write_line(std::size_t row, const char* text)
     return error_;
 }
 
-void Display::show(std::initializer_list<Text> lines)
+void Display::show(std::initializer_list<Text> lines, bool log)
 {
-    std::string joined;
-    for (const Text& line : lines) {
-        if (!joined.empty()) {
-            joined += " | ";
+    if (log) {
+        std::string joined;
+        for (const Text& line : lines) {
+            if (!joined.empty()) {
+                joined += " | ";
+            }
+            joined += line.c_str();
         }
-        joined += line.c_str();
+        ESP_LOGI(kTag, "%s", joined.c_str());
     }
-    ESP_LOGI(kTag, "%s", joined.c_str());
 
     if (!ready_) {
         // Try to bring a display back that was unplugged or never answered.
@@ -190,6 +202,9 @@ void Display::show(std::initializer_list<Text> lines)
 Addresses Display::scan()
 {
     Addresses found;
+    if (bus_ == nullptr) {
+        return found;
+    }
     for (std::uint16_t address = 0x08; address <= 0x77; ++address) {
         if (i2c_master_probe(bus_, address, kI2cTimeoutMs) == ESP_OK) {
             found.set(address);
@@ -198,6 +213,6 @@ Addresses Display::scan()
     return found;
 }
 
-bool Display::present() { return i2c_master_probe(bus_, kLcdAddress, kI2cTimeoutMs) == ESP_OK; }
+bool Display::present() { return bus_ != nullptr && i2c_master_probe(bus_, kLcdAddress, kI2cTimeoutMs) == ESP_OK; }
 
 } // namespace ping

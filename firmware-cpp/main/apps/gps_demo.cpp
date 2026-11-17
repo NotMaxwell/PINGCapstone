@@ -1,8 +1,8 @@
 /// @file
 /// Standalone demo for the NEO-M9N GPS.
 ///
-/// Asks the receiver what it is, configures it for UBX at
-/// @ref ping::kGpsRateHz and shows the position, its accuracy and the
+/// Configures the receiver for UBX at
+/// @ref ping::kGpsRateHz, shows what it is, then shows the position, its accuracy and the
 /// satellite count on the display and in the log, five times a second. Kept
 /// separate from main.cpp so the application entry point stays clear of
 /// sensor bring-up code.
@@ -26,7 +26,8 @@ extern "C" void app_main()
 
     lcd.show({"GPS", "starting"});
     for (;;) {
-        if (const auto version = gps.connect()) {
+        const auto version = gps.configure(kGpsRateHz);
+        if (version) {
             lcd.show({
                 "GPS up",
                 version->module,
@@ -35,20 +36,21 @@ extern "C" void app_main()
             });
             break;
         }
-        lcd.show({"GPS no reply", "retrying"});
-        vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
-    }
-
-    while (!gps.configure(kGpsRateHz)) {
-        lcd.show({"GPS refused", "config", "retrying"});
+        lcd.show({"GPS not ready", gps::to_string(version.error()), "retrying"});
         vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
     }
 
     RefreshTimer refresh{kLcdRefreshMs};
     for (;;) {
-        const auto solution = gps.poll();
+        const auto solution = gps.read(kGpsSilenceMs);
         if (!solution) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+            lcd.show({"GPS read failed", gps::to_string(solution.error())});
+            if (solution.error() == gps::Error::kTimeout) {
+                // Quiet that long: probably lost power and its configuration.
+                while (!gps.configure(kGpsRateHz)) {
+                    vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
+                }
+            }
             continue;
         }
         if (!refresh.due()) {
@@ -59,7 +61,7 @@ extern "C" void app_main()
             lcd.show({
                 Text("lat %+12.7f", solution->latitude_deg),
                 Text("lon %+12.7f", solution->longitude_deg),
-                Text("acc ±%.1f m", solution->horizontal_accuracy_m),
+                Text("acc ±%.1f m", static_cast<double>(solution->horizontal_accuracy_m)),
                 Text("%u satellites", solution->satellites),
             });
         } else {

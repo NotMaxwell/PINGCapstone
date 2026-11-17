@@ -1,13 +1,16 @@
 /// @file
 /// Standalone demo for the BNO085 IMU.
 ///
-/// Brings up the sensor hub over SPI, starts the rotation vector at 100 Hz and
+/// Brings up the sensor hub over SPI, starts the hub's own rotation vector at
+/// 100 Hz and
 /// shows the orientation as yaw, pitch and roll on the display and in the
 /// log, five times a second. Kept separate from main.cpp so the application
 /// entry point stays clear of sensor bring-up code.
 ///
 /// The angles are those of the breakout itself, with its printed +Y axis as
-/// forward; see @ref ping::geo::to_euler. Yaw is from magnetic north.
+/// forward; see @ref ping::geo::to_euler. Yaw is from magnetic north by the
+/// hub's own magnetometer calibration, not the main program's compass. A hub
+/// that goes quiet or resets is started again.
 
 #include "ping/constants.hpp"
 #include "ping/display.hpp"
@@ -29,31 +32,39 @@ extern "C" void app_main()
     static imu::Imu imu;
 
     lcd.show({"BNO085", "starting"});
-    while (!imu.start(kImuReportIntervalUs)) {
-        lcd.show({"BNO085 no reply", "retrying"});
-        vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
-    }
-    const sh2_ProductId_t id = imu.product_id();
-    lcd.show({
-        "BNO085 up",
-        Text("fw %u.%u.%u", id.swVersionMajor, id.swVersionMinor, id.swVersionPatch),
-        Text("reset cause %u", id.resetCause),
-    });
-
-    RefreshTimer refresh{kLcdRefreshMs};
     for (;;) {
-        const auto orientation = imu.wait();
-        if (!orientation || !refresh.due()) {
+        const auto id = imu.start();
+        if (id && imu.enable_report(imu::SensorId::kRotationVector, kImuReportIntervalUs)) {
+            lcd.show({
+                "BNO085 up",
+                Text("fw %u.%u.%u", id->sw_major, id->sw_minor, id->sw_patch),
+                Text("reset cause %u", id->reset_cause),
+            });
+        } else {
+            lcd.show({"BNO085 failed", id ? "enable report" : imu::to_string(id.error()), "retrying"});
+            vTaskDelay(pdMS_TO_TICKS(kRetryDelayMs));
             continue;
         }
 
-        const geo::Euler angles = geo::to_euler(orientation->quaternion);
-        const float accuracy_deg = orientation->heading_accuracy_rad * (180.0F / std::numbers::pi_v<float>);
-        lcd.show({
-            Text("yaw   %7.1f°", angles.yaw_deg),
-            Text("pitch %+7.1f°", angles.pitch_deg),
-            Text("roll  %+7.1f°", angles.roll_deg),
-            Text("acc %s ±%.1f°", imu::to_string(orientation->calibration), accuracy_deg),
-        });
+        RefreshTimer refresh{kLcdRefreshMs};
+        for (;;) {
+            const auto event = imu.next(kImuSilenceMs);
+            if (!event || !*event) {
+                lcd.show({"BNO085 lost", event ? "went quiet" : imu::to_string(event.error()), "restarting"});
+                break;
+            }
+            if ((*event)->sensor != imu::SensorId::kRotationVector || !refresh.due()) {
+                continue;
+            }
+            const imu::Event& e = **event;
+            const geo::Euler angles = geo::to_euler(e.quaternion);
+            const float accuracy_deg = e.heading_accuracy_rad * (180.0F / std::numbers::pi_v<float>);
+            lcd.show({
+                Text("yaw   %7.1f°", static_cast<double>(angles.yaw_deg)),
+                Text("pitch %+7.1f°", static_cast<double>(angles.pitch_deg)),
+                Text("roll  %+7.1f°", static_cast<double>(angles.roll_deg)),
+                Text("acc %s ±%.1f°", geo::to_string(e.accuracy), static_cast<double>(accuracy_deg)),
+            });
+        }
     }
 }

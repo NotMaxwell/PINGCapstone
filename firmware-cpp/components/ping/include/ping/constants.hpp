@@ -4,7 +4,9 @@
 /// Everything in here is decided once, by the hardware or by the design, and
 /// does not change while the firmware runs. Change a pin or a setting here and
 /// every application that uses it follows. It mirrors `src/constants.rs` in
-/// the Rust firmware; keep the two in step.
+/// the Rust firmware; keep the two in step. Settings that do not depend on
+/// ESP-IDF (rates, aiming, calibration, timing) are in @ref ping/settings.hpp,
+/// which this includes.
 ///
 /// # Pin map
 ///
@@ -40,7 +42,7 @@
 
 #pragma once
 
-#include "ping/geo.hpp"
+#include "ping/settings.hpp"
 
 #include <driver/gpio.h>
 #include <driver/i2c_types.h>
@@ -85,8 +87,8 @@ inline constexpr gpio_num_t kImuMiso = GPIO_NUM_13;
 inline constexpr gpio_num_t kImuInt = GPIO_NUM_14;
 /// Breakout RST: active-low reset.
 inline constexpr gpio_num_t kImuReset = GPIO_NUM_9;
-/// Breakout P0 (PS0/WAKE). Held high so the hub comes up in SPI mode; the
-/// esp32_BNO08x library does not use it as a wake line.
+/// Breakout P0 (PS0/WAKE): held high through reset to select SPI, then
+/// pulsed low to wake the hub before each write, as the Rust driver does.
 inline constexpr gpio_num_t kImuWake = GPIO_NUM_8;
 
 // I2C display, run from 3V3.
@@ -126,67 +128,5 @@ inline constexpr std::uint8_t kLcdAddress = 0x3C;
 /// SH1106 there is a column offset of 2, an SSD1306 one of 0.
 enum class LcdController : std::uint8_t { kSsd1306, kSh1106 };
 inline constexpr LcdController kLcdController = LcdController::kSh1106;
-
-// ---------------------------------------------------------------------------
-// Sensor rates
-// ---------------------------------------------------------------------------
-
-/// How many positions a second the GPS computes.
-inline constexpr std::uint8_t kGpsRateHz = 10;
-
-/// How often the IMU reports its orientation: every 10 ms, i.e. 100 Hz.
-inline constexpr std::uint32_t kImuReportIntervalUs = 10'000;
-
-// ---------------------------------------------------------------------------
-// Aiming
-// ---------------------------------------------------------------------------
-
-/// The direction the LiDAR looks, in the IMU's frame: the axes printed on the
-/// BNO085 breakout. Set this to match how the two are mounted. The default is
-/// +Y because that is where the BNO085 itself points: lying level with +Y
-/// towards magnetic north, it reports no rotation at all.
-inline constexpr geo::Vec3 kLidarBoresight{.x = 0.0F, .y = 1.0F, .z = 0.0F};
-
-/// How far magnetic north lies east of true north where the device is used,
-/// in degrees, negative for west. The IMU measures bearings from magnetic
-/// north, but coordinates are laid out from true north. Look the value up at
-/// <https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml>.
-inline constexpr float kMagneticDeclinationDeg = 0.0F;
-
-// ---------------------------------------------------------------------------
-// Timing, in milliseconds
-// ---------------------------------------------------------------------------
-
-// Readings older than these when the button is pressed are not used. The GPS
-// allowance covers a few missed solutions; the IMU and LiDAR report 100 times
-// a second, so a quarter of a second without a report means something is
-// wrong.
-inline constexpr std::uint32_t kMaxGpsAgeMs = 2'000;
-inline constexpr std::uint32_t kMaxImuAgeMs = 250;
-inline constexpr std::uint32_t kMaxLidarAgeMs = 250;
-
-/// A GPS this long without a solution has probably lost power, and with it
-/// its configuration, which lives in RAM. The GPS task then configures it
-/// again.
-inline constexpr std::uint32_t kGpsSilenceMs = 3'000;
-
-/// An IMU this long without a report has probably reset, which stops every
-/// report. The IMU task then starts it again.
-inline constexpr std::uint32_t kImuSilenceMs = 1'000;
-
-/// A TF03 this long without a measurement is not sending any: it streams 100
-/// a second.
-inline constexpr std::uint32_t kLidarSilenceMs = 1'000;
-
-/// How long the button has to stay down to count as pressed, or up to count
-/// as released: longer than a switch's contact bounce, shorter than a tap.
-inline constexpr std::uint32_t kDebounceMs = 30;
-
-/// How often the demos rewrite the display. A reading that changes faster
-/// than this is a blur anyway.
-inline constexpr std::uint32_t kLcdRefreshMs = 200;
-
-/// How long to wait before retrying a sensor that failed to come up.
-inline constexpr std::uint32_t kRetryDelayMs = 1'000;
 
 } // namespace ping
