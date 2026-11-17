@@ -702,6 +702,10 @@ pub struct Compass {
     east: f32,
     north: f32,
     samples: u32,
+    /// Whether `east` and `north` hold an estimate yet. It outlives a change
+    /// of calibration, so the heading never goes dark while a new one
+    /// settles.
+    has_estimate: bool,
     /// How far the field has lately been from the calibrated strength, µT.
     deviation: f32,
 }
@@ -714,16 +718,17 @@ impl Compass {
             east: 0.0,
             north: 0.0,
             samples: 0,
+            has_estimate: false,
             deviation: 0.0,
         }
     }
 
-    /// Switches to a new calibration. Where north lies has to be worked out
-    /// afresh, because the old estimate was made with the old correction.
+    /// Switches to a new calibration. The old estimate of north was made
+    /// with the old correction, so the next reading that passes the new
+    /// calibration's strength check replaces it outright. Until one does,
+    /// the old estimate stands, rather than the heading going dark.
     pub fn set_calibration(&mut self, calibration: MagCalibration) {
         self.calibration = Some(calibration);
-        self.east = 0.0;
-        self.north = 0.0;
         self.samples = 0;
     }
 
@@ -762,6 +767,7 @@ impl Compass {
         // A plain average to begin with, so the first reading counts in
         // full, then a moving one.
         self.samples = (self.samples + 1).min(HEADING_AVERAGE);
+        self.has_estimate = true;
         let weight = 1.0 / self.samples as f32;
         let world = rotate(&game, field);
         self.east += (world.x - self.east) * weight;
@@ -772,7 +778,7 @@ impl Compass {
     /// and an undisturbed field reading.
     pub fn heading(&self) -> Option<Heading> {
         let game = self.game?;
-        if self.samples == 0 {
+        if !self.has_estimate {
             return None;
         }
 
