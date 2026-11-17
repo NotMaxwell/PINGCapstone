@@ -2,6 +2,7 @@
 
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #include <algorithm>
 #include <variant>
@@ -32,6 +33,9 @@ constexpr std::array<std::uint32_t, 15> kSupportedBaudRates{
 
 /// Room the ESP-IDF driver keeps for received bytes between reads.
 constexpr int kRxRingBuffer = 2048;
+
+/// UART events the driver can queue before it starts dropping them.
+constexpr int kEventQueueLen = 16;
 
 std::unexpected<Error> fail(Error::Kind kind) { return std::unexpected(Error{.kind = kind}); }
 
@@ -117,20 +121,84 @@ const char* to_string(const Error& error)
 
 esp_err_t Tf03::begin(gpio_num_t tx, gpio_num_t rx, int baud)
 {
+    tx_ = tx;
+    rx_ = rx;
+    baud_ = baud;
+    return install();
+}
+
+esp_err_t Tf03::install()
+{
     uart_config_t config{};
-    config.baud_rate = baud;
+    config.baud_rate = baud_;
     config.data_bits = UART_DATA_8_BITS;
     config.parity = UART_PARITY_DISABLE;
     config.stop_bits = UART_STOP_BITS_1;
     config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     config.source_clk = UART_SCLK_DEFAULT;
-    if (esp_err_t err = uart_driver_install(port_, kRxRingBuffer, 0, 0, nullptr, 0); err != ESP_OK) {
+    // The event queue is only for counting line errors and overflows; the
+    // data itself is read straight from the driver's ring buffer.
+    if (esp_err_t err = uart_driver_install(port_, kRxRingBuffer, 0, kEventQueueLen, &events_, 0); err != ESP_OK) {
         return err;
     }
     if (esp_err_t err = uart_param_config(port_, &config); err != ESP_OK) {
         return err;
     }
-    return uart_set_pin(port_, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    return uart_set_pin(port_, tx_, rx_, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
+esp_err_t Tf03::restart_uart()
+{
+    if (uart_is_driver_installed(port_)) {
+        if (esp_err_t err = uart_driver_delete(port_); err != ESP_OK) {
+            return err;
+        }
+    }
+    events_ = nullptr;
+    parser_.reset();
+    rx_start_ = rx_end_ = 0;
+    ++stats_.uart_restarts;
+    return install();
+}
+
+void Tf03::drain_events()
+{
+    if (events_ == nullptr) {
+        return;
+    }
+    uart_event_t event;
+    while (xQueueReceive(events_, &event, 0) == pdTRUE) {
+        switch (event.type) {
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+            // The driver stops taking bytes until the buffer is emptied, and
+            // what it holds is no longer contiguous with what follows.
+            (event.type == UART_FIFO_OVF ? stats_.fifo_overflows : stats_.buffer_full)++;
+            uart_flush_input(port_);
+            xQueueReset(events_);
+            parser_.reset();
+            rx_start_ = rx_end_ = 0;
+            return;
+        case UART_FRAME_ERR:
+            ++stats_.frame_errors;
+            break;
+        case UART_PARITY_ERR:
+            ++stats_.parity_errors;
+            break;
+        case UART_BREAK:
+            ++stats_.breaks;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+const LinkStats& Tf03::stats()
+{
+    drain_events();
+    stats_.parser = parser_.counts();
+    return stats_;
 }
 
 Measurement Tf03::measurement(const DataFrame& frame) const
@@ -152,6 +220,7 @@ std::expected<Measurement, Error> Tf03::read(std::uint32_t timeout_ms)
             return std::unexpected(packet.error());
         }
         if (const auto* frame = std::get_if<DataFrame>(&*packet)) {
+            stats_.last_frame_us = esp_timer_get_time();
             return measurement(*frame);
         }
     }
@@ -171,6 +240,7 @@ std::expected<Packet, Error> Tf03::read_packet(std::int64_t deadline_us)
             }
         }
 
+        drain_events();
         const std::int64_t remaining_us = deadline_us - esp_timer_get_time();
         if (remaining_us <= 0) {
             return fail(Error::Kind::kTimeout);
@@ -198,6 +268,7 @@ std::expected<Packet, Error> Tf03::read_packet(std::int64_t deadline_us)
         }
         if (count > 0) {
             heard_ = std::max(heard_, Heard::kNoise);
+            stats_.last_byte_us = esp_timer_get_time();
         }
         rx_start_ = 0;
         rx_end_ = static_cast<std::size_t>(count);

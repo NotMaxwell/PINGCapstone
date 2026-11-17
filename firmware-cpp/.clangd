@@ -1,0 +1,23 @@
+# clangd setup for firmware-cpp. Use Espressif's clangd (on PATH after
+# sourcing ESP-IDF's export.sh): upstream clangd has no Xtensa target.
+# See BUILD.md, "Editors".
+CompileFlags:
+  # Firmware sources: the database `idf.py --preset default build` writes.
+  CompilationDatabase: build/main
+  # GCC-only flags left in the database when building with IDF_TOOLCHAIN=gcc.
+  Remove:
+    - -mlongcalls
+    - -fno-tree-switch-conversion
+    - -fstrict-volatile-bitfields
+    - -mtext-section-literals
+    - -fno-shrink-wrap
+    - -mdisable-hardware-atomics
+    - -specs=*
+Diagnostics:
+  UnusedIncludes: Strict
+---
+# Host tests build with the system clang through the "host" preset.
+If:
+  PathMatch: test/host/.*
+CompileFlags:
+  CompilationDatabase: build/host

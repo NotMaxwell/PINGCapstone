@@ -105,11 +105,24 @@ using Packet = std::variant<DataFrame, Response>;
 /// nine byte discard lands on the same false header.
 class Parser {
   public:
+    /// What the parser has seen since it was made, for telling a silent
+    /// sensor from one whose bytes do not parse.
+    struct Counts {
+        std::uint32_t bytes = 0;
+        std::uint32_t packets = 0;
+        /// Candidates with a plausible header whose checksum disagreed.
+        std::uint32_t checksum_errors = 0;
+        /// Bytes thrown away while looking for a header.
+        std::uint32_t skipped = 0;
+    };
+
     /// Forgets any partly received packet, e.g. after bytes were lost.
     void reset() { len_ = 0; }
 
     /// Adds one received byte, returning a packet if it completed one.
     std::optional<Packet> push(std::uint8_t byte);
+
+    [[nodiscard]] const Counts& counts() const { return counts_; }
 
   private:
     [[nodiscard]] bool plausible_start() const;
@@ -119,6 +132,7 @@ class Parser {
     static constexpr std::size_t kMaxPacketLen = kDataFrameLen > kMaxCommandLen ? kDataFrameLen : kMaxCommandLen;
     std::array<std::uint8_t, kMaxPacketLen> buf_{};
     std::size_t len_ = 0;
+    Counts counts_;
 };
 
 } // namespace ping::tf03

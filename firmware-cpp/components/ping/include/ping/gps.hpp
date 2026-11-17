@@ -1,129 +1,61 @@
 /// @file
 /// The u-blox NEO-M9N GNSS receiver (as on the SparkFun GPS-15733 breakout),
-/// over UART.
+/// over an ESP-IDF UART.
 ///
-/// The UBX protocol itself (framing, checksums, CFG-VALSET, NAV-PVT and
-/// MON-VER decoding) comes from SparkFun's u-blox GNSS v4 library, which is a
-/// native ESP-IDF component. This file adds the board's configuration and a
-/// plain @ref Solution that does not depend on the library's types, as the
-/// Rust firmware's `neo_m9n` module does on top of the `ublox` crate.
+/// The protocol lives in @ref ping::ubx, which the host tests cover; this file
+/// is the UART plumbing around it, mirroring the Rust firmware's `neo_m9n`
+/// module: @ref Gps::configure writes one `UBX-CFG-VALSET` (UBX only on UART1,
+/// one `UBX-NAV-PVT` per solution, the rate) to the receiver's RAM and
+/// battery-backed RAM layers, never flash, and @ref Gps::read waits for the
+/// next solution.
 ///
-/// # Configuration
-///
-/// @ref Gps::configure turns NMEA off on UART1, asks for one `UBX-NAV-PVT`
-/// per navigation solution and sets the rate, all in the receiver's RAM
-/// layer only. Nothing is left behind in its flash, so a fresh board and a
-/// reused one behave the same after a power cycle; the price is that a power
-/// glitch puts the receiver back to factory NMEA output, which is why the
-/// application configures it again whenever it goes quiet.
+/// Nothing here aborts. A UART FIFO overflow or a full receive ring buffer
+/// flushes the input and surfaces as @ref Error::kOverflow, after which
+/// reading can simply continue.
 
 #pragma once
 
-#include <SparkFun_u-blox_GNSS_v4.h>
+#include "ping/ubx.hpp"
+
 #include <driver/gpio.h>
 #include <driver/uart.h>
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-#include <optional>
+#include <expected>
+#include <span>
 
 namespace ping::gps {
 
-/// The fastest navigation rate the NEO-M9N supports.
-inline constexpr std::uint8_t kMaxNavRateHz = 25;
+using ubx::FixType;
+using ubx::kMaxNavRateHz;
+using ubx::Solution;
+using ubx::UtcTime;
+using ubx::Version;
+using ubx::to_string;
 
-/// What kind of solution the receiver has.
-enum class FixType : std::uint8_t {
-    kNoFix = 0,
-    /// Position from dead reckoning alone. The NEO-M9N has no sensor fusion,
-    /// so this should not appear.
-    kDeadReckoningOnly = 1,
-    kFix2D = 2,
-    kFix3D = 3,
-    kGnssPlusDeadReckoning = 4,
-    /// Time is known but position is not trusted.
-    kTimeOnly = 5,
+/// What the driver can fail at.
+enum class Error : std::uint8_t {
+    /// @ref Gps::begin has not succeeded.
+    kNotStarted,
+    /// An ESP-IDF UART call failed; the code is in the log.
+    kUart,
+    /// The receiver did not answer in time.
+    kTimeout,
+    /// The receiver refused the configuration (`UBX-ACK-NAK`).
+    kRejected,
+    /// The rate asked for is not one the receiver supports.
+    kUnsupported,
+    /// Received bytes were lost (UART FIFO overflow or full ring buffer). The
+    /// input was flushed; call again.
+    kOverflow,
 };
 
-const char* to_string(FixType fix);
-
-/// UTC date and time of a solution.
-struct UtcTime {
-    std::uint16_t year;
-    std::uint8_t month;
-    std::uint8_t day;
-    std::uint8_t hour;
-    std::uint8_t minute;
-    std::uint8_t second;
-    /// Fraction of the second, which can be negative: the receiver rounds
-    /// the other fields to the nearest second and puts the remainder here.
-    std::int32_t nanosecond;
-};
-
-/// One navigation solution, decoded from `UBX-NAV-PVT`.
-struct Solution {
-    /// GPS time of week of the navigation epoch, milliseconds.
-    std::uint32_t itow_ms;
-    FixType fix_type;
-    /// The fix is within the receiver's DOP and accuracy masks. Treat the
-    /// position as usable only when this is set; @ref position does.
-    bool fix_ok;
-    /// Differential corrections (e.g. SBAS) were applied.
-    bool differential;
-    /// Satellites used in the solution.
-    std::uint8_t satellites;
-    /// Degrees, positive north.
-    double latitude_deg;
-    /// Degrees, positive east.
-    double longitude_deg;
-    /// Height above the WGS-84 ellipsoid, metres.
-    float height_ellipsoid_m;
-    /// Height above mean sea level, metres.
-    float height_msl_m;
-    /// 1σ horizontal position accuracy estimate, metres.
-    float horizontal_accuracy_m;
-    /// 1σ vertical position accuracy estimate, metres.
-    float vertical_accuracy_m;
-    /// Velocity north, east and down, m/s.
-    float velocity_ned_mps[3];
-    /// Horizontal speed, m/s.
-    float ground_speed_mps;
-    /// 1σ speed accuracy estimate, m/s.
-    float speed_accuracy_mps;
-    /// Direction of travel, degrees clockwise from north. Meaningless when
-    /// standing still.
-    float heading_of_motion_deg;
-    /// 1σ heading accuracy estimate, degrees.
-    float heading_accuracy_deg;
-    /// Position dilution of precision.
-    float pdop;
-    /// UTC time of the solution, once the receiver has resolved it fully.
-    std::optional<UtcTime> utc;
-    /// The receiver flagged latitude, longitude and heights as invalid
-    /// despite a fix.
-    bool invalid_position;
-
-    /// Whether the receiver vouches for @ref latitude_deg and
-    /// @ref longitude_deg.
-    [[nodiscard]] bool has_position() const
-    {
-        const bool positioned = fix_type == FixType::kFix2D || fix_type == FixType::kFix3D ||
-                                fix_type == FixType::kGnssPlusDeadReckoning;
-        return positioned && fix_ok && !invalid_position;
-    }
-};
-
-/// What the receiver says it is, from `UBX-MON-VER`.
-struct Version {
-    /// e.g. `NEO-M9N`.
-    const char* module;
-    /// e.g. `SPG`.
-    const char* firmware_type;
-    std::uint8_t firmware_major;
-    std::uint8_t firmware_minor;
-    std::uint8_t protocol_major;
-    std::uint8_t protocol_minor;
-};
+const char* to_string(Error error);
 
 /// A NEO-M9N on one of the ESP32's UARTs.
 class Gps {
@@ -134,25 +66,38 @@ class Gps {
     /// given pins, 8N1 at `baud`. Nothing is sent.
     esp_err_t begin(gpio_num_t tx, gpio_num_t rx, int baud);
 
-    /// Waits for signs of life from the receiver and reads what it is. Also
-    /// a cheap way to check it is there and the baud rate matches.
-    std::optional<Version> connect();
-
     /// Switches UART1 to UBX-only output and sets the receiver to send one
-    /// `UBX-NAV-PVT` per solution, `rate_hz` solutions a second. `rate_hz`
-    /// must be between 1 and @ref kMaxNavRateHz.
-    bool configure(std::uint8_t rate_hz);
+    /// `UBX-NAV-PVT` per solution, `rate_hz` solutions a second, then asks
+    /// what the receiver is. `rate_hz` must be between 1 and
+    /// @ref kMaxNavRateHz. Each of the two exchanges gets one second. Stale
+    /// overflow errors are ignored while waiting: the bytes lost were sent
+    /// before the request, so the reply can still arrive.
+    std::expected<Version, Error> configure(std::uint8_t rate_hz);
 
-    /// The next navigation solution if one has arrived, without waiting.
+    /// Blocks until the next navigation solution or `timeout_ms`.
     ///
     /// Solutions arrive once per navigation epoch whether or not there is a
     /// fix; check @ref Solution::has_position before using the position.
-    std::optional<Solution> poll();
+    std::expected<Solution, Error> read(std::uint32_t timeout_ms);
 
   private:
+    enum class Wait : std::uint8_t { kFrame, kTimeout, kOverflow, kUartError };
+
+    Wait next_frame(std::int64_t deadline_us, ubx::Frame& out);
+    /// Drains the driver's event queue; true if bytes were lost, in which
+    /// case the input is flushed and the parser reset.
+    bool handle_events();
+    bool send(std::span<const std::uint8_t> bytes);
+
     uart_port_t port_;
     bool started_ = false;
-    SFE_UBLOX_GNSS_SERIAL gnss_;
+    QueueHandle_t events_ = nullptr;
+    ubx::Parser parser_;
+    /// The last chunk taken from the driver, of which [rx_pos_, rx_len_) has
+    /// not been handed to the parser yet.
+    std::array<std::uint8_t, 64> rx_{};
+    std::size_t rx_pos_ = 0;
+    std::size_t rx_len_ = 0;
 };
 
 } // namespace ping::gps

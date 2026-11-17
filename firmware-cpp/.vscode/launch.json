@@ -1,0 +1,56 @@
+{
+  // Hardware debugging through the ESP32-S3's built-in USB-JTAG: no probe
+  // needed, the same USB cable that flashes the board. Flash the debug build
+  // first ("firmware: flash debug build"); the "openocd" task starts the GDB
+  // server. Neovim's nvim-dap reads this file too (see .nvim.lua).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ESP32-S3: debug main (OpenOCD)",
+      "type": "cppdbg",
+      "request": "launch",
+      "MIMode": "gdb",
+      "miDebuggerPath": "xtensa-esp32s3-elf-gdb",
+      "miDebuggerServerAddress": "localhost:3333",
+      "program": "${workspaceFolder}/build/main-debug/ping_capstone.elf",
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "preLaunchTask": "openocd",
+      "setupCommands": [
+        { "text": "set remotetimeout 20" }
+      ],
+      "postRemoteConnectCommands": [
+        { "text": "monitor reset halt" },
+        { "text": "maintenance flush register-cache" },
+        { "text": "thbreak app_main" }
+      ]
+    },
+    {
+      "name": "ESP32-S3: attach to running main (OpenOCD)",
+      "type": "cppdbg",
+      "request": "launch",
+      "MIMode": "gdb",
+      "miDebuggerPath": "xtensa-esp32s3-elf-gdb",
+      "miDebuggerServerAddress": "localhost:3333",
+      "program": "${workspaceFolder}/build/main-debug/ping_capstone.elf",
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "preLaunchTask": "openocd",
+      "setupCommands": [
+        { "text": "set remotetimeout 20" }
+      ]
+    },
+    {
+      "name": "Host tests (gdb)",
+      "type": "cppdbg",
+      "request": "launch",
+      "MIMode": "gdb",
+      "program": "${workspaceFolder}/build/host/test/host/ping_host_tests",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "externalConsole": false,
+      "preLaunchTask": "host tests"
+    }
+  ]
+}

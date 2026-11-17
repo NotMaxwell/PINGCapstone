@@ -1,0 +1,17 @@
+{
+  // clangd does code intelligence; cpptools is only here for its debugger.
+  "C_Cpp.intelliSenseEngine": "disabled",
+  // "clangd" resolves to Espressif's esp-clangd when VS Code is started from a
+  // shell that sourced ESP-IDF's export.sh (see BUILD.md). Otherwise set the
+  // full path, e.g. ~/.espressif/tools/esp-clangd/<version>/esp-clangd/bin/clangd.
+  "clangd.path": "clangd",
+  "clangd.arguments": ["--background-index", "--clang-tidy", "--header-insertion=never"],
+  // CMake Tools drives only the host tests; firmware goes through idf.py
+  // (tasks.json), which needs ESP-IDF's environment.
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": false,
+  "cmake.copyCompileCommands": "",
+  "files.associations": { "sdkconfig*": "properties", "*.defaults": "properties" },
+  "editor.formatOnSave": false,
+  "[cpp]": { "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd" }
+}

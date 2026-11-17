@@ -1,0 +1,76 @@
+{
+  // Every firmware task calls idf.py, so start VS Code from a shell that has
+  // sourced ESP-IDF's export.sh (BUILD.md). Pick the application with the
+  // "preset" prompt; each preset has its own build directory.
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "preset",
+      "type": "pickString",
+      "description": "Firmware preset (application and toolchain)",
+      "options": ["default", "gps_demo", "imu_demo", "lidar_demo", "lcd_demo", "main-debug", "main-gcc"],
+      "default": "default"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "firmware: build",
+      "type": "shell",
+      "command": "idf.py --preset ${input:preset} build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "firmware: flash + monitor",
+      "type": "shell",
+      "command": "idf.py --preset ${input:preset} flash monitor",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "firmware: monitor",
+      "type": "shell",
+      "command": "idf.py --preset ${input:preset} monitor",
+      "problemMatcher": []
+    },
+    {
+      "label": "firmware: flash debug build",
+      "type": "shell",
+      "command": "idf.py --preset main-debug flash",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "firmware: menuconfig",
+      "type": "shell",
+      "command": "idf.py --preset ${input:preset} menuconfig",
+      "problemMatcher": []
+    },
+    {
+      "label": "openocd",
+      "detail": "GDB server on :3333 through the S3's built-in USB-JTAG",
+      "type": "shell",
+      "command": "openocd -f board/esp32s3-builtin.cfg",
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": { "regexp": "^(Error):\\s+(.*)$", "severity": 1, "message": 2 },
+        "background": {
+          "activesBegin": "^Open On-Chip Debugger",
+          "endsPattern": "Listening on port 3333 for gdb connections"
+        }
+      }
+    },
+    {
+      "label": "host tests",
+      "type": "shell",
+      "command": "cmake --preset host && cmake --build --preset host && ctest --preset host",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "host tests (ASan + UBSan)",
+      "type": "shell",
+      "command": "cmake --preset host-asan && cmake --build --preset host-asan && ctest --preset host-asan",
+      "group": "test",
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

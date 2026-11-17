@@ -48,7 +48,7 @@ Euler to_euler(const Quaternion& orientation)
     };
 }
 
-Aim Aim::from_orientation(const Quaternion& orientation, const Vec3& boresight, float declination_deg)
+Aim Aim::from_orientation(const Quaternion& orientation, const Vec3& boresight, float correction_deg)
 {
     const float x = orientation.i;
     const float y = orientation.j;
@@ -66,7 +66,7 @@ Aim Aim::from_orientation(const Quaternion& orientation, const Vec3& boresight, 
     const float north = 2.0F * (x * y + w * z) * bx + (w * w - x * x + y * y - z * z) * by + 2.0F * (y * z - w * x) * bz;
     const float up = 2.0F * (x * z - w * y) * bx + 2.0F * (y * z + w * x) * by + (w * w - x * x - y * y + z * z) * bz;
 
-    float azimuth_deg = degrees(std::atan2(east, north)) + declination_deg;
+    float azimuth_deg = degrees(std::atan2(east, north)) + correction_deg;
     if (azimuth_deg < 0.0F) {
         azimuth_deg += 360.0F;
     }

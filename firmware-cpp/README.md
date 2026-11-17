@@ -1,88 +1,86 @@
 # PING firmware: C++ port
 
 An ESP-IDF version of the Rust firmware in `../src`, with the same main
-program, the same four peripheral demos and the same pin map. It exists to see
-what the project looks like in C++ on ESP-IDF. The Rust firmware is still the
-real one.
+program, peripheral demos and pin map. It runs on ESP-IDF's FreeRTOS: one task
+per sensor, each with blocking calls that time out. The Rust firmware is still
+the reference and the one that has run on hardware.
 
-Unlike the first attempt at this port, it writes as little as possible itself.
-The libraries listed below do the drivers' heavy lifting, and ESP-IDF's own
-drivers stand in for the hand-made HAL layer.
+**Build, flash, test and debug commands are in [BUILD.md](BUILD.md).**
+Rules for AI agents working here are in [CLAUDE.md](CLAUDE.md).
 
-## What comes from where
+## Driver choices
+
+The aim is that no driver of ours can be the reason a sensor stops talking.
+The IMU and LiDAR both drop out on the Rust port, and this port is the
+control: it uses the manufacturer's code wherever the manufacturer publishes
+any, built only on ESP-IDF's current (`esp_driver_*`) APIs, and counts what
+happens on each sensor's wire so a dropout can be pinned on the sensor, the
+wiring or the code. Every error is reported and recovered from at runtime.
 
 | Part | Source | Written here |
 |------|--------|--------------|
-| BNO085 IMU (SPI, SH-2) | [esp32_BNO08x](https://github.com/myles-parfeniuk/esp32_BNO08x), which wraps CEVA's own [sh2](https://github.com/ceva-dsp/sh2) reference driver | `imu.cpp`: bring-up on our pins and the rotation-vector hand-off |
-| NEO-M9N GPS (UBX) | [SparkFun u-blox GNSS v4](https://components.espressif.com/components/sparkfun/sparkfun_u-blox_gnss_v4), a native ESP-IDF component | `gps.cpp`: the CFG-VALSET we want and a plain `Solution` |
-| SH1106/SSD1306 OLED | [u8g2](https://github.com/olikraus/u8g2): controllers, fonts, drawing | `display.cpp`: the `i2c_master` callback and the four-line text layout |
-| TF03 LiDAR | none exists | `tf03_protocol.cpp` and `tf03.cpp`, ported from `src/tf03` |
-| Target geometry | none needed | `geo.cpp`, ported from `src/geo.rs` |
-| UART, SPI, I²C, GPIO, timing | ESP-IDF drivers and FreeRTOS | nothing |
+| BNO085 IMU (SPI, SH-2) | CEVA's [sh2](https://github.com/ceva-dsp/sh2) reference driver v1.4.0, vendored unchanged in `components/sh2` | `shtp_spi.cpp`: CEVA's reference SPI HAL (`sh2-demo-nucleo/app/spi_hal.c`), ported with its states and timings kept; the deviations are listed in the file. Tested against a fake hub. `bno085_hal.cpp`: its ESP-IDF pins, SPI and INT interrupt. `imu.cpp`: bring-up, reports, events |
+| NEO-M9N GPS (UBX) | none | `ubx.cpp`: UBX framing, CFG-VALSET, NAV-PVT/MON-VER/ACK decoding, host tested. `gps.cpp`: the receiver on ESP-IDF's UART driver |
+| TF03 LiDAR | Benewake publishes no driver, only the frame format in its manual | `tf03_protocol.cpp`, `tf03.cpp`, ported from `src/tf03`, with wire counters (bytes, frames, bad checksums, UART errors) |
+| SH1106/SSD1306 OLED | [u8g2](https://github.com/olikraus/u8g2) 2.37.1: controllers, fonts | `display.cpp`: the `i2c_master` callback, bus recovery, text layout |
+| Compass | none | `mag_cal.cpp`, ported from `src/mag_cal.rs`: hard/soft iron fitting, start-up hard iron calibration, heading from the game rotation vector |
+| Target geometry | none | `geo.cpp`, ported from `src/geo.rs` |
 
-The ESP-IDF component manager fetches the libraries on the first build
-(`components/ping/idf_component.yml`). `dependencies.lock` pins exactly what
-was fetched.
+u8g2 is the only library fetched at build time (pinned in
+`components/ping/idf_component.yml` to the 2.37.1 tag).
+
+What changed from the previous version of this port, which used the
+esp32_BNO08x wrapper and SparkFun's u-blox library:
+
+- **BNO085 SPI.** CEVA's own reference HAL instead of esp32_BNO08x, which
+  never drove the WAKE pin.
+- **GPIO ISR service.** Installed once and shared; the IMU's INT handler no
+  longer fights other users for it.
+- **Compass.** The bearing comes from the game rotation vector and the ESP32's
+  own magnetometer correction (`mag_cal`), as in the Rust firmware, instead of
+  the hub's rotation vector. It includes `kHeadingCorrectionDeg` and the hard
+  iron calibration found during handling after power up.
+- **Fallback position, display task, compass and GPS logging**, as in the
+  Rust main program.
+- **Link diagnostics.** When the IMU or LiDAR fails or goes quiet, its task
+  logs its wire counters (IMU: INT edges, SPI transfers and failures, bad
+  headers, hub resets; LiDAR: bytes, frames, checksum and UART errors), and the
+  LiDAR task restarts the ESP32's UART to rule it out.
+- **Failure handling.** No `ESP_ERROR_CHECK` after start-up. Sensor tasks
+  retry bring-up forever, restart a sensor that goes silent, flush a UART that
+  overflowed, clock a stuck I²C bus free, and feed the task watchdog, so a
+  driver call that hangs anyway restarts the chip.
 
 ## Layout
 
 ```
-CMakeLists.txt          ESP-IDF project
-sdkconfig.defaults      ESP32-S3 N8R8, 1 kHz tick, USB-Serial-JTAG console
+CMakeLists.txt          ESP-IDF project; also the host tests with -DPING_HOST_TESTS=ON
+CMakePresets.json       one preset per application / toolchain / host test build
+sdkconfig.defaults      ESP32-S3 N8R8, 1 kHz tick, USB-Serial-JTAG console, task watchdog
+sdkconfig.debug         layered on top by the main-debug preset
 main/apps/              one file per application, each with its own app_main
   main.cpp              the PING program: button press -> target coordinate
   gps_demo.cpp  imu_demo.cpp  lidar_demo.cpp  lcd_demo.cpp
 components/ping/        everything the applications share
-  include/ping/constants.hpp   pin map and fixed settings (mirrors src/constants.rs)
+  include/ping/constants.hpp   pin map and buses (mirrors src/constants.rs)
+  include/ping/settings.hpp    rates, aiming, calibration, timing (no ESP-IDF)
+components/sh2/         CEVA's SH-2 driver, vendored
 test/host/              GoogleTest suite for the parts that touch no hardware
+.clangd .vscode/ .nvim.lua     editor setup, see BUILD.md
 ```
-
-## Building and flashing
-
-Needs ESP-IDF 6.0 or later; it has been built with 6.1.
-
-```sh
-. ~/Dev/Work/esp-idf/export.sh
-
-# The main program
-idf.py -B build/main flash monitor
-
-# A demo: main, gps_demo, imu_demo, lidar_demo or lcd_demo
-idf.py -B build/imu_demo -DPING_APP=imu_demo flash monitor
-```
-
-Each application gets its own build directory, so switching between them does
-not rebuild everything. Logs, and the main program's `target #n: ...` lines,
-come out of the USB port the board is flashed through.
-
-## Host tests
-
-```sh
-cmake -S test/host -B build/host
-cmake --build build/host
-ctest --test-dir build/host
-```
-
-GoogleTest is fetched by CMake; nothing needs installing.
 
 ## Differences from the Rust firmware
 
-- **Logging.** Diagnostics go through `ESP_LOG` on the USB serial port instead
-  of RTT. The target lines share that port.
-- **Display offset.** u8g2's SH1106 driver knows where that controller's glass
-  sits, so `kLcdController` replaces the Rust `LCD_COLUMN_OFFSET`.
-- **BNO085 WAKE pin.** esp32_BNO08x does not drive PS0/WAKE. The port holds it
-  high so the hub comes up in SPI mode and leaves it there. The Rust driver
-  pulses it low before each write. If writes to the hub turn out unreliable on
-  hardware, look here first.
-- **BNO085 over I²C.** Not available: esp32_BNO08x is SPI only, and the board
-  is wired for SPI.
+- **Logging.** `ESP_LOG` on the USB serial port instead of RTT. The target
+  lines share that port.
+- **Display offset.** u8g2 knows where the SH1106's glass sits, so
+  `kLcdController` replaces the Rust `LCD_COLUMN_OFFSET`.
+- **BNO085 over I²C.** Not implemented: the board is wired for SPI.
 - **Button.** Polled every 5 ms rather than woken by an edge interrupt.
-  esp32_BNO08x installs the shared GPIO ISR service itself, and polling keeps
-  the two from contending over it.
-- **Wi-Fi.** The Rust main program starts the Wi-Fi controller for a future
-  web page but does not use it. This port leaves Wi-Fi out until there is
-  something to use it for.
+- **Wi-Fi.** Left out until there is something to use it for.
+- **Calibration tools.** `imu_cal`, `heading_cal`, `compass_diag` and
+  `gps_diag` are not ported yet; use the Rust binaries to measure
+  `kMagCalibration` and `kHeadingCorrectionDeg`.
 
-None of this has been run on hardware yet. Every application builds, and the
-host tests pass.
+None of this has been run on hardware yet. Every application builds with
+esp-clang and GCC, and the host tests pass.

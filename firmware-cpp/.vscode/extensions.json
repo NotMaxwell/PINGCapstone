@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "llvm-vs-code-extensions.vscode-clangd",
+    "ms-vscode.cpptools",
+    "ms-vscode.cmake-tools"
+  ],
+  "unwantedRecommendations": ["ms-vscode.cpptools-extension-pack"]
+}

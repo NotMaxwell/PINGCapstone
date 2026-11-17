@@ -1,0 +1,12 @@
+# Matches the style the existing sources are written in.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+AccessModifierOffset: -2
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+PointerAlignment: Left
+SortIncludes: Never

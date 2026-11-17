@@ -7,17 +7,28 @@ CONFIG_SPIRAM_MODE_OCT=y
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# The SparkFun u-blox library times its waits in ticks and recommends 1 kHz.
+# 1 ms ticks, so the drivers' millisecond timeouts mean what they say.
 CONFIG_FREERTOS_HZ=1000
 
 # Logs and the target lines both go out the USB port the board is flashed
-# through; UART0 stays free.
+# through (the S3's built-in USB-Serial-JTAG, which is also the debugger);
+# UART0 stays free. Without a host reading it, output is dropped rather than
+# blocking the task that printed it.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
-# esp32_BNO08x: give up waiting for a report after 100 ms rather than 3 s, so
-# the IMU task notices a silent hub within ping::kImuSilenceMs. Pins and the
-# SPI clock are passed in code from ping/constants.hpp, not set here.
-CONFIG_ESP32_BNO08X_DATA_AVAILABLE_TIMEOUT_MS=100
+# A driver call that hangs despite its own timeouts must not leave a device
+# that looks alive but reports nothing. Every sensor task feeds the task
+# watchdog; one that stops for 10 s panics the chip, which restarts.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# Catch stack overruns where they happen, not as corruption later.
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y

@@ -32,6 +32,26 @@ struct Vec3 {
     float z;
 };
 
+/// How far a heading can be trusted, as the BNO085 grades its own reports
+/// and as @ref ping::mag_cal::Compass grades the headings it works out.
+enum class Accuracy : unsigned char { kUnreliable, kLow, kMedium, kHigh };
+
+/// A short name for an accuracy, for logs and the display.
+constexpr const char* to_string(Accuracy accuracy)
+{
+    switch (accuracy) {
+    case Accuracy::kHigh:
+        return "high";
+    case Accuracy::kMedium:
+        return "medium";
+    case Accuracy::kLow:
+        return "low";
+    case Accuracy::kUnreliable:
+        break;
+    }
+    return "unreliable";
+}
+
 /// A unit quaternion describing orientation, as the BNO085 reports it.
 struct Quaternion {
     float i;
@@ -62,8 +82,8 @@ struct Euler {
 /// or down (pitch ±90°), yaw and roll turn about the same axis and only their
 /// difference is meaningful.
 ///
-/// The esp32_BNO08x library has its own `get_euler()`, but it uses a
-/// different axis convention, so this one is kept to match the Rust firmware.
+/// CEVA's sh2 library has its own Euler conversion, but it uses a different
+/// axis convention, so this one is kept to match the Rust firmware.
 Euler to_euler(const Quaternion& orientation);
 
 /// A direction from the device, relative to the local horizon.
@@ -75,15 +95,16 @@ struct Aim {
 
     /// The direction `boresight` points, given the IMU's orientation.
     ///
-    /// `orientation` is the BNO085's rotation vector. The BNO085 uses
+    /// `orientation` is the compass's (see @ref ping/mag_cal.hpp), in the
+    /// BNO085's frames. The BNO085 uses
     /// Android's frames of reference, so the quaternion turns a vector in the
     /// sensor's own frame (the axes printed on the breakout) into a world
     /// frame whose X axis points east, Y to magnetic north and Z up.
     /// `boresight` is the direction the LiDAR looks, in the sensor's frame;
-    /// it need not be a unit vector. `declination_deg` is how far magnetic
-    /// north lies east of true north where the device is, which turns the
-    /// magnetic bearing into a true one.
-    static Aim from_orientation(const Quaternion& orientation, const Vec3& boresight, float declination_deg);
+    /// it need not be a unit vector. `correction_deg` is added to the bearing,
+    /// positive clockwise: @ref ping::kHeadingCorrectionDeg, which turns the
+    /// IMU's magnetic heading into a true one.
+    static Aim from_orientation(const Quaternion& orientation, const Vec3& boresight, float correction_deg);
 };
 
 /// A point on the Earth.
