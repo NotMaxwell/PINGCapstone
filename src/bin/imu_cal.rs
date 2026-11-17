@@ -395,6 +395,16 @@ mod cal {
         }
     }
 
+    /// How many sectors the readings cover around the centre a fit finds,
+    /// which is what the final check counts. The middle of the range on each
+    /// axis, which [`Collector::covered`] uses, can be several sectors out.
+    fn fitted_coverage(readings: &Collector) -> usize {
+        match fit(readings.samples()) {
+            Ok(calibration) => coverage(readings.samples(), calibration.offset),
+            Err(_) => readings.covered(),
+        }
+    }
+
     /// Prints the six point check: from each axis's reading up and down,
     /// `(up + down) / 2` is its bias and `g / ((up - down) / 2)` its scale.
     /// The hub keeps its own accelerometer calibration, so this is a check
@@ -558,15 +568,17 @@ mod cal {
         // between them, which only a tumble gets to.
         rprintln!("Keep turning the device through every direction.");
         let mut next_refresh = Instant::now();
-        while readings.covered() < REQUIRED_SECTORS && !readings.is_full() {
+        let mut covered = fitted_coverage(&readings);
+        while covered < REQUIRED_SECTORS && !readings.is_full() {
             next_accel(&mut imu, &mut readings).await;
             if due(&mut next_refresh) {
+                covered = fitted_coverage(&readings);
                 show_quietly(
                     &mut lcd,
                     &[
                         format_args!("tumble slowly"),
                         format_args!("all directions"),
-                        format_args!("cover {}/{}", readings.covered(), SECTORS),
+                        format_args!("cover {}/{}", covered, SECTORS),
                         format_args!("{}/{} kept", readings.samples().len(), CAPACITY),
                     ],
                 )
