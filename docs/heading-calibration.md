@@ -131,9 +131,13 @@ turns it about one axis. Until it succeeds, the application uses
 `MAG_CALIBRATION`, and the RTT log says `Compass calibrated from handling` when
 it does.
 
-This does not replace `imu_cal`. Only the full sequence can measure soft iron,
-and the offset it learns is forgotten at the next power up. `heading_cal` uses
-`MAG_CALIBRATION` alone, so measure the heading correction after `imu_cal`.
+This does not replace `imu_cal`, and it only runs once `MAG_CALIBRATION` is
+set. Only the full sequence can measure soft iron, and without that a fit from
+handling can pass every check and still be badly wrong; on this device soft
+iron stretches the field by about half. Until then the display reads
+`no cal: imu_cal`. The offset it learns is forgotten at the next power up.
+`heading_cal` uses `MAG_CALIBRATION` alone, so measure the heading correction
+after `imu_cal`.
 
 ### 3. Check the field with `compass_diag`
 
