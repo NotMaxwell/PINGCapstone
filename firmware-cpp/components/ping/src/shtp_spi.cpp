@@ -77,12 +77,13 @@ void SpiHal::run_transfers()
     while (transfer_pending_) {
         transfer_pending_ = false;
         if (bus_.transfer(pending_tx_, pending_rx_, pending_len_)) {
+            ++counters_.transfers_ok;
             if (is_open_) {
                 spi_completed();
             }
             continue;
         }
-        ++bus_errors_;
+        ++counters_.transfers_failed;
         bus_.csn(true);
         if (spi_state_ == SpiState::kWrite) {
             tx_buf_len_ = 0;
@@ -136,6 +137,10 @@ void SpiHal::spi_completed()
 {
     // Get length of payload available
     auto rx_len = static_cast<std::uint16_t>((rx_buf_[0] + (rx_buf_[1] << 8)) & ~0x8000);
+
+    if (spi_state_ == SpiState::kRdHdr || spi_state_ == SpiState::kWrite) {
+        count_header(rx_len);
+    }
 
     // Truncate that to max len we can read
     if (rx_len > rx_buf_.size()) {
@@ -193,6 +198,21 @@ void SpiHal::spi_completed()
 
         // Activate the next operation, if any.
         spi_activate();
+    }
+}
+
+void SpiHal::count_header(std::uint16_t rx_len)
+{
+    constexpr std::uint16_t kAllOnes = 0x7FFF;
+    if (rx_len == 0) {
+        ++counters_.empty_headers;
+    } else if (rx_len <= kReadLen || rx_len == kAllOnes) {
+        ++counters_.invalid_headers;
+    } else {
+        ++counters_.cargos_read;
+        if (rx_len > rx_buf_.size()) {
+            ++counters_.oversized_cargos;
+        }
     }
 }
 
@@ -334,6 +354,7 @@ int SpiHal::read(std::uint8_t* buffer, unsigned len, std::uint32_t* t_us)
             rx_buf_len_ = 0;
         } else {
             // Discard what was read and return error because buffer was too small.
+            ++counters_.discarded_cargos;
             retval = kSh2ErrBadParam;
             rx_buf_len_ = 0;
         }
@@ -362,7 +383,7 @@ int SpiHal::write(const std::uint8_t* buffer, unsigned len)
         }
         tx_buf_len_ = 0;
         bus_.ps0_waken(true);
-        ++wake_timeouts_;
+        ++counters_.wake_timeouts;
         return kSh2ErrTimeout;
     }
 

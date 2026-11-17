@@ -318,7 +318,7 @@ TEST(SpiHal, WriteGivesUpWhenHubNeverAnswersWake)
     EXPECT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), ping::shtp::kSh2ErrTimeout);
     const std::vector<std::string> expected{"wake+"};
     EXPECT_EQ(rig.hub.log, expected);
-    EXPECT_EQ(rig.hal.take_wake_timeouts(), 1U);
+    EXPECT_EQ(rig.hal.counters().wake_timeouts, 1U);
     // The next write starts afresh.
     EXPECT_EQ(rig.hal.write(kCommand.data(), static_cast<unsigned>(kCommand.size())), 6);
 }
@@ -361,7 +361,7 @@ TEST(SpiHal, BusFailureIsCountedAndRecovered)
     std::array<std::uint8_t, 64> buf{};
     std::uint32_t t = 0;
     EXPECT_EQ(rig.hal.read(buf.data(), buf.size(), &t), 0);
-    EXPECT_EQ(rig.hal.take_bus_errors(), 1U);
+    EXPECT_EQ(rig.hal.counters().transfers_failed, 1U);
     EXPECT_EQ(rig.hub.log.back(), "cs+");
 
     rig.hub.fail_transfers = false;

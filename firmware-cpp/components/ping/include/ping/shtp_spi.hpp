@@ -70,6 +70,29 @@ struct SpiBus {
     virtual std::uint32_t time_now_us() = 0;
 };
 
+/// Link counters, kept alongside CEVA's state machine without changing it.
+/// All counts are since construction and wrap at 32 bits.
+struct LinkCounters {
+    /// INTN falling edges the interrupt reported.
+    std::uint32_t int_edges;
+    /// Low 32 bits of the microsecond clock at the last INTN edge.
+    std::uint32_t last_int_us;
+    std::uint32_t transfers_ok;
+    std::uint32_t transfers_failed;
+    /// Cargos with a payload, read whole or clocked in during a write.
+    std::uint32_t cargos_read;
+    /// Header reads of length 0: INTN without anything to send.
+    std::uint32_t empty_headers;
+    /// Header reads of length 1 to 4, or all ones (a floating MISO).
+    std::uint32_t invalid_headers;
+    /// Cargos longer than the receive buffer, truncated as CEVA does.
+    std::uint32_t oversized_cargos;
+    /// Cargos dropped because sh2's buffer was too small for them.
+    std::uint32_t discarded_cargos;
+    /// Writes abandoned because the hub never answered WAKE.
+    std::uint32_t wake_timeouts;
+};
+
 /// The sh2_Hal_t methods of CEVA's SPI HAL, for one BNO08x.
 class SpiHal {
   public:
@@ -87,6 +110,7 @@ class SpiHal {
     /// time and sets flags.
     void on_intn(std::uint32_t now_us)
     {
+        int_edges_.fetch_add(1, std::memory_order_relaxed);
         rx_timestamp_us_.store(now_us);
         in_reset_.store(false);
         rx_ready_.store(true);
@@ -113,21 +137,12 @@ class SpiHal {
     [[nodiscard]] bool in_reset() const { return in_reset_.load(); }
     [[nodiscard]] bool is_open() const { return is_open_; }
 
-    /// SPI transfers that failed since the last call; each one dropped
-    /// whatever it was moving.
-    std::uint32_t take_bus_errors()
+    [[nodiscard]] LinkCounters counters() const
     {
-        const std::uint32_t n = bus_errors_;
-        bus_errors_ = 0;
-        return n;
-    }
-    /// Writes abandoned because the hub never answered WAKE, since the last
-    /// call.
-    std::uint32_t take_wake_timeouts()
-    {
-        const std::uint32_t n = wake_timeouts_;
-        wake_timeouts_ = 0;
-        return n;
+        LinkCounters out = counters_;
+        out.int_edges = int_edges_.load(std::memory_order_relaxed);
+        out.last_int_us = rx_timestamp_us_.load();
+        return out;
     }
 
   private:
@@ -139,6 +154,7 @@ class SpiHal {
     void start_transfer(const std::uint8_t* tx, std::uint8_t* rx, std::size_t len);
     void run_transfers();
     void reset_delay_us(std::uint32_t delay);
+    void count_header(std::uint16_t rx_len);
 
     SpiBus& bus_;
     SpiState spi_state_ = SpiState::kInit;
@@ -164,8 +180,8 @@ class SpiHal {
     bool aborted_ = false;
     std::uint32_t deadline_start_us_ = 0;
     std::uint32_t deadline_us_ = 0;
-    std::uint32_t bus_errors_ = 0;
-    std::uint32_t wake_timeouts_ = 0;
+    std::atomic<std::uint32_t> int_edges_{0};
+    LinkCounters counters_{};
 };
 
 } // namespace ping::shtp
