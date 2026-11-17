@@ -100,6 +100,10 @@ const MAX_STARTUP_RESIDUAL: f32 = 0.015;
 /// allows.
 const STARTUP_RESIDUAL_ROOM: f32 = 1.25;
 
+/// How much further the readings must spread, µT, before
+/// [`StartupCalibration`] gives out a better calibration than its last.
+const STARTUP_SPREAD_STEP_UT: f32 = 2.0;
+
 /// How many newly kept readings to wait for between attempts at a fit.
 const STARTUP_RETRY_READINGS: usize = 10;
 
@@ -655,7 +659,9 @@ pub struct StartupCalibration {
     /// strength and residual are what a fit here is judged against.
     reference: MagCalibration,
     next_attempt: usize,
-    done: bool,
+    /// How widely the readings behind the last calibration given out were
+    /// spread, µT; zero before the first.
+    given_spread_ut: f32,
 }
 
 impl StartupCalibration {
@@ -669,14 +675,15 @@ impl StartupCalibration {
             readings: Collector::new(),
             reference,
             next_attempt: MIN_STARTUP_SAMPLES,
-            done: false,
+            given_spread_ut: 0.0,
         }
     }
 
-    /// Takes an uncalibrated field reading. Returns a calibration the one
-    /// time it has one it trusts; nothing after that.
+    /// Takes an uncalibrated field reading. Returns a calibration when it
+    /// has one it trusts, and again whenever the readings have spread far
+    /// enough further to trust a better one, until its store is full.
     pub fn add(&mut self, raw: Vec3) -> Option<MagCalibration> {
-        if self.done || !self.readings.add(raw) {
+        if !self.readings.add(raw) {
             return None;
         }
         let samples = self.readings.samples();
@@ -692,14 +699,15 @@ impl StartupCalibration {
         // same field it saw. Comparing with Earth's field instead would
         // refuse every fit indoors, where the field often reads stronger.
         let residual_limit = (reference.residual * STARTUP_RESIDUAL_ROOM).max(MAX_STARTUP_RESIDUAL);
-        let trusted = found.spread_ut >= MIN_STARTUP_SPREAD_UT
+        let trusted = found.spread_ut
+            >= MIN_STARTUP_SPREAD_UT.max(self.given_spread_ut + STARTUP_SPREAD_STEP_UT)
             && calibration.residual <= residual_limit
             && (calibration.field_ut - reference.field_ut).abs()
                 <= FIELD_TOLERANCE * reference.field_ut;
         if !trusted {
             return None;
         }
-        self.done = true;
+        self.given_spread_ut = found.spread_ut;
         Some(calibration)
     }
 }
