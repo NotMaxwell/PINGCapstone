@@ -10,16 +10,18 @@ Rules for AI agents working here are in [CLAUDE.md](CLAUDE.md).
 
 ## Driver choices
 
-The aim is that no driver can be the reason the device does not work. So the
-drivers are either the chip vendor's own reference code or a port of the Rust
-drivers that have run on this hardware, built only on ESP-IDF's current
-(`esp_driver_*`) APIs. Every error is reported and recovered from at runtime.
+The aim is that no driver of ours can be the reason a sensor stops talking.
+The IMU and LiDAR both drop out on the Rust port, and this port is the
+control: it uses the manufacturer's code wherever the manufacturer publishes
+any, built only on ESP-IDF's current (`esp_driver_*`) APIs, and counts what
+happens on each sensor's wire so a dropout can be pinned on the sensor, the
+wiring or the code. Every error is reported and recovered from at runtime.
 
 | Part | Source | Written here |
 |------|--------|--------------|
-| BNO085 IMU (SPI, SH-2) | CEVA's [sh2](https://github.com/ceva-dsp/sh2) reference driver v1.4.0, vendored unchanged in `components/sh2` | `shtp_spi.cpp`: the SPI transport, matching the Rust driver's INT/WAKE/RST handling, tested against a fake bus. `bno085_hal.cpp`: that transport on ESP-IDF's SPI master. `imu.cpp`: bring-up, reports, events |
+| BNO085 IMU (SPI, SH-2) | CEVA's [sh2](https://github.com/ceva-dsp/sh2) reference driver v1.4.0, vendored unchanged in `components/sh2` | `shtp_spi.cpp`: CEVA's reference SPI HAL (`sh2-demo-nucleo/app/spi_hal.c`), ported with its states and timings kept; the deviations are listed in the file. Tested against a fake hub. `bno085_hal.cpp`: its ESP-IDF pins, SPI and INT interrupt. `imu.cpp`: bring-up, reports, events |
 | NEO-M9N GPS (UBX) | none | `ubx.cpp`: UBX framing, CFG-VALSET, NAV-PVT/MON-VER/ACK decoding, host tested. `gps.cpp`: the receiver on ESP-IDF's UART driver |
-| TF03 LiDAR | none exists | `tf03_protocol.cpp`, `tf03.cpp`, ported from `src/tf03` |
+| TF03 LiDAR | Benewake publishes no driver, only the frame format in its manual | `tf03_protocol.cpp`, `tf03.cpp`, ported from `src/tf03`, with wire counters (bytes, frames, bad checksums, UART errors) |
 | SH1106/SSD1306 OLED | [u8g2](https://github.com/olikraus/u8g2) 2.37.1: controllers, fonts | `display.cpp`: the `i2c_master` callback, bus recovery, text layout |
 | Compass | none | `mag_cal.cpp`, ported from `src/mag_cal.rs`: hard/soft iron fitting, start-up hard iron calibration, heading from the game rotation vector |
 | Target geometry | none | `geo.cpp`, ported from `src/geo.rs` |
@@ -30,8 +32,8 @@ u8g2 is the only library fetched at build time (pinned in
 What changed from the previous version of this port, which used the
 esp32_BNO08x wrapper and SparkFun's u-blox library:
 
-- **BNO085 WAKE pin.** Now pulsed low before every write and waited on, as the
-  Rust driver and CEVA's SPI notes do. esp32_BNO08x only held it high.
+- **BNO085 SPI.** CEVA's own reference HAL instead of esp32_BNO08x, which
+  never drove the WAKE pin.
 - **GPIO ISR service.** Installed once and shared; the IMU's INT handler no
   longer fights other users for it.
 - **Compass.** The bearing comes from the game rotation vector and the ESP32's
@@ -40,6 +42,10 @@ esp32_BNO08x wrapper and SparkFun's u-blox library:
   iron calibration found during handling after power up.
 - **Fallback position, display task, compass and GPS logging**, as in the
   Rust main program.
+- **Link diagnostics.** When the IMU or LiDAR fails or goes quiet, its task
+  logs its wire counters (IMU: INT edges, SPI transfers and failures, bad
+  headers, hub resets; LiDAR: bytes, frames, checksum and UART errors), and the
+  LiDAR task restarts the ESP32's UART to rule it out.
 - **Failure handling.** No `ESP_ERROR_CHECK` after start-up. Sensor tasks
   retry bring-up forever, restart a sensor that goes silent, flush a UART that
   overflowed, clock a stuck I²C bus free, and feed the task watchdog, so a

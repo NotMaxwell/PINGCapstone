@@ -20,8 +20,10 @@ recovered from at runtime; nothing in a sensor path aborts the chip.
   building too.
 - Only ESP-IDF's current drivers (`esp_driver_*`: `i2c_master`, `spi_master`, `uart`,
   `gpio`, `usb_serial_jtag`). No legacy `driver/i2c.h`, no Arduino layers.
-- Drivers: CEVA's `sh2` (vendored in `components/sh2`, unchanged) for the BNO085, with our
-  own HAL; our own UBX code for the NEO-M9N; our own TF03 code; u8g2 for the display. Add a
+- Drivers: manufacturer code wherever it exists, so sensor dropouts seen on the Rust port can
+  be pinned on hardware rather than our code. CEVA's `sh2` (vendored in `components/sh2`,
+  unchanged) for the BNO085, over a port of CEVA's reference SPI HAL that keeps its states
+  and timings (deviations are listed in `shtp_spi.cpp`); our own UBX code for the NEO-M9N; our own TF03 code; u8g2 for the display. Add a
   third-party library only when the user agrees.
 - No `ESP_ERROR_CHECK` (or anything else that aborts) after start-up: check every
   `esp_err_t`, log it with `esp_err_to_name`, and retry or re-initialise. `ESP_ERROR_CHECK`
