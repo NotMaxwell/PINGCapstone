@@ -1,0 +1,57 @@
+# Builds the C++ firmware for every application and runs the host tests, so
+# the firmware can be built and downloaded without installing anything
+# locally. Flash the downloaded files from a browser: see
+# firmware-cpp/BUILD.md, "Flashing from a browser".
+name: firmware-cpp
+
+on:
+  push:
+    paths: ["firmware-cpp/**", ".github/workflows/firmware-cpp.yml"]
+  pull_request:
+    paths: ["firmware-cpp/**", ".github/workflows/firmware-cpp.yml"]
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    # Espressif's image of the pinned ESP-IDF release, with its GCC toolchain.
+    container: espressif/idf:v6.1.1
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [default, gps_demo, imu_demo, lidar_demo, lcd_demo, main-gcc, main-debug]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.preset }}
+        shell: bash
+        working-directory: firmware-cpp
+        run: |
+          . "$IDF_PATH/export.sh"
+          # The image ships GCC only; the presets build with esp-clang.
+          python "$IDF_PATH/tools/idf_tools.py" install esp-clang
+          . "$IDF_PATH/export.sh"
+          idf.py --preset "${{ matrix.preset }}" build
+      - name: Collect flash files
+        shell: bash
+        working-directory: firmware-cpp
+        run: |
+          dir="$(python3 -c "import json;print(next(p['binaryDir'] for p in json.load(open('CMakePresets.json'))['configurePresets'] if p['name']=='${{ matrix.preset }}'))")"
+          mkdir -p out
+          cp "$dir/bootloader/bootloader.bin" "$dir/partition_table/partition-table.bin" \
+             "$dir/ping_capstone.bin" "$dir/ping_capstone.elf" "$dir/flash_args" out/
+          printf 'bootloader.bin       0x0\npartition-table.bin  0x8000\nping_capstone.bin    0x10000\n' > out/FLASH-OFFSETS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.preset == 'default' && 'main' || matrix.preset }}
+          path: firmware-cpp/out/
+          if-no-files-found: error
+
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang, libc++ and Ninja
+        run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev ninja-build
+      - name: Build and test
+        working-directory: firmware-cpp
+        run: cmake --preset host && cmake --build --preset host && ctest --preset host

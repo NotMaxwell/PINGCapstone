@@ -163,6 +163,40 @@ allow the file when asked. It gives you:
   `:PingOpenOCD`, start the configuration, then type `monitor reset halt` in
   the DAP REPL.
 
+## On a locked-down PC (no programs may be installed or run)
+
+Everything except editing can be done from a web browser.
+
+1. **Build** happens on GitHub: `.github/workflows/firmware-cpp.yml` builds every
+   preset and runs the host tests on each push that touches `firmware-cpp/`.
+   On GitHub, open **Actions → firmware-cpp →** the latest run, and download the
+   artifact for the application you want (`main`, `imu_demo`, ...). It holds
+   `bootloader.bin`, `partition-table.bin`, `ping_capstone.bin`, the `.elf` for
+   decoding crashes, and `FLASH-OFFSETS.txt`. To build without pushing a change,
+   use **Run workflow** on that page.
+2. **Flash** from Chrome or Edge (they speak USB serial natively) at
+   <https://espressif.github.io/esptool-js/>: plug the board in by its **USB**
+   port, **Connect**, pick the port, then add the three files at these offsets
+   and **Program**:
+
+   | File | Offset |
+   |------|--------|
+   | `bootloader.bin` | `0x0` |
+   | `partition-table.bin` | `0x8000` |
+   | `ping_capstone.bin` | `0x10000` |
+
+   If it cannot connect, hold **BOOT**, tap **RESET**, release **BOOT**, and try again.
+3. **Monitor**: the same page's **Console** tab (115200 baud is fine; the USB
+   port ignores the rate) shows the logs and the `target #n: ...` lines. Press
+   **RESET** on the board after flashing.
+4. **Crashes**: copy the `Backtrace:` line from the console; it is decoded
+   against the `.elf` from the same artifact with
+   `xtensa-esp32s3-elf-addr2line -pfiaC -e ping_capstone.elf <addresses>` on any
+   machine that has the toolchain (or ask Claude, which has one).
+
+JTAG debugging needs OpenOCD and GDB, which are programs, so it is not
+available this way.
+
 ## When something goes wrong
 
 | Symptom | Likely cause |
