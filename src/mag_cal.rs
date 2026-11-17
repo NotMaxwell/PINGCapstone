@@ -25,10 +25,10 @@
 //! [`Collector`] and [`fit`], and prints the [`MagCalibration`] to put in
 //! `constants.rs`.
 
-use libm::{atan2f, cbrt, cosf, sinf, sqrt, sqrtf};
+use libm::{atan2f, atanf, cbrt, cosf, sinf, sqrt, sqrtf};
 
 use crate::bno085::{Accuracy, Quaternion, Vec3};
-use crate::constants::EXPECTED_FIELD_UT;
+use crate::constants::{EXPECTED_DIP_DEG, EXPECTED_FIELD_UT};
 
 /// How many readings [`Collector`] keeps.
 pub const CAPACITY: usize = 512;
@@ -65,6 +65,20 @@ pub const MAX_RESIDUAL: f32 = 0.03;
 
 /// How far the fitted field strength may sit from Earth's, as a fraction.
 pub const FIELD_TOLERANCE: f32 = 0.2;
+
+/// The largest residual `imu_cal` still gives out a calibration for, with a
+/// warning: about 6° of heading error. Indoors, the field varying from spot
+/// to spot usually keeps the residual above [`MAX_RESIDUAL`].
+pub const MAX_USABLE_RESIDUAL: f32 = 0.05;
+
+/// Roughly how much heading error a calibration's residual brings, degrees.
+///
+/// The residual is about the root mean square error in field strength, as a
+/// fraction of it. Only the horizontal part of the field sets the heading,
+/// and that is `cos(dip)` of the whole.
+pub fn heading_error_deg(residual: f32) -> f32 {
+    atanf(residual / cosf(EXPECTED_DIP_DEG.to_radians())).to_degrees()
+}
 
 /// The fewest kept readings [`StartupCalibration`] will fit.
 const MIN_STARTUP_SAMPLES: usize = 60;
