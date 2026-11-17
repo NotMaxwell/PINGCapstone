@@ -531,7 +531,7 @@ mod cal {
     fn print_constant(c: &MagCalibration) {
         let [r0, r1, r2] = c.matrix;
         rprintln!("Put this in src/constants.rs:");
-        rprintln!("    pub const MAG_CALIBRATION: Option<MagCalibration> = Some(MagCalibration {{");
+        rprintln!("    pub const MAG_CALIBRATION: Option<MagCalibration> = Some(MagCalibration {");
         rprintln!(
             "        offset: [{:.4}, {:.4}, {:.4}],",
             c.offset[0],
@@ -545,7 +545,7 @@ mod cal {
         rprintln!("        ],");
         rprintln!("        field_ut: {:.3},", c.field_ut);
         rprintln!("        residual: {:.5},", c.residual);
-        rprintln!("    }});");
+        rprintln!("    });");
     }
 
     /// Resets the hub, wipes its calibration and starts the reports the
