@@ -149,8 +149,8 @@ mod cal {
         EXPECTED_FIELD_UT, IMU_SILENCE, LCD_REFRESH, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::mag_cal::{
-        CAPACITY, Collector, FIELD_TOLERANCE, MAX_RESIDUAL, MagCalibration, REQUIRED_SECTORS,
-        SECTORS, coverage, fit,
+        CAPACITY, Collector, FIELD_TOLERANCE, MAX_RESIDUAL, MAX_USABLE_RESIDUAL, MagCalibration,
+        REQUIRED_SECTORS, SECTORS, coverage, fit, heading_error_deg,
     };
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
@@ -415,13 +415,18 @@ mod cal {
         }
     }
 
-    /// Prints the fit, and returns why it should not be used, if it should
-    /// not.
-    fn report_fit(
-        calibration: &MagCalibration,
-        sectors: usize,
-        samples: usize,
-    ) -> Option<&'static str> {
+    /// What a fit is good for.
+    enum Verdict {
+        /// Use it.
+        Good,
+        /// Use it, but expect more heading error than a clean run gives.
+        Usable,
+        /// Do not use it, for this reason.
+        Unusable(&'static str),
+    }
+
+    /// Prints the fit and says what it is good for.
+    fn report_fit(calibration: &MagCalibration, sectors: usize, samples: usize) -> Verdict {
         let [bx, by, bz] = calibration.offset;
         let [r0, r1, r2] = calibration.matrix;
         rprintln!("---- magnetometer fit, {} readings", samples);
@@ -436,43 +441,49 @@ mod cal {
         rprintln!("                 {:.4} {:.4} {:.4}", r1[0], r1[1], r1[2]);
         rprintln!("                 {:.4} {:.4} {:.4}", r2[0], r2[1], r2[2]);
         rprintln!(
-            "field strength {:.1} uT (expect {:.1}), residual {:.4} (limit {:.4})",
+            "field strength {:.1} uT (Earth's here {:.1}), residual {:.4} (good under {:.2}, \
+             usable under {:.2}): about {:.1} deg of heading error",
             calibration.field_ut,
             EXPECTED_FIELD_UT,
             calibration.residual,
-            MAX_RESIDUAL
+            MAX_RESIDUAL,
+            MAX_USABLE_RESIDUAL,
+            heading_error_deg(calibration.residual)
         );
 
-        // Every failure is printed, worst first; the display has room for
-        // only the first.
-        let problems = [
-            (
-                calibration.residual > MAX_RESIDUAL,
-                "residual too big",
-                "the readings do not lie on one ellipsoid, so the field changed during the \
-                 run: the device was moved near iron or a laptop, a magnet near the IMU shifted, \
-                 or a current changed",
-            ),
-            (
-                (calibration.field_ut - EXPECTED_FIELD_UT).abs()
-                    > FIELD_TOLERANCE * EXPECTED_FIELD_UT,
-                "wrong field",
-                "something near the device adds to Earth's field",
-            ),
-            (
-                sectors < REQUIRED_SECTORS,
-                "too few directions",
-                "turn it through more orientations",
-            ),
-        ];
-        let mut first = None;
-        for (failed, short, why) in problems {
-            if failed {
-                rprintln!("Problem: {}: {}.", short, why);
-                first.get_or_insert(short);
-            }
+        if sectors < REQUIRED_SECTORS {
+            rprintln!("Problem: too few directions: turn it through more orientations.");
+            return Verdict::Unusable("too few directions");
         }
-        first
+        if calibration.residual > MAX_USABLE_RESIDUAL {
+            rprintln!(
+                "Problem: residual too big: the field changed during the run. Turn the device in \
+                 place rather than carrying it around, away from desks, laptops and steel, and \
+                 check that nothing magnetic near the IMU can shift."
+            );
+            return Verdict::Unusable("residual too big");
+        }
+
+        let mut verdict = Verdict::Good;
+        if calibration.residual > MAX_RESIDUAL {
+            rprintln!(
+                "Warning: the residual is above {:.2}, usually because the field varies from spot \
+                 to spot indoors. Usable, but a run outdoors would cut the heading error.",
+                MAX_RESIDUAL
+            );
+            verdict = Verdict::Usable;
+        }
+        if (calibration.field_ut - EXPECTED_FIELD_UT).abs() > FIELD_TOLERANCE * EXPECTED_FIELD_UT {
+            rprintln!(
+                "Warning: the field here is {:.1} uT, not Earth's {:.1}. That does not change \
+                 the heading, but the compass will call the field disturbed somewhere it reads \
+                 differently, so calibrate where the device is used.",
+                calibration.field_ut,
+                EXPECTED_FIELD_UT
+            );
+            verdict = Verdict::Usable;
+        }
+        verdict
     }
 
     /// Prints the calibration in the form it goes in `constants.rs`.
@@ -600,16 +611,24 @@ mod cal {
         match fit(readings.samples()) {
             Ok(calibration) => {
                 let sectors = coverage(readings.samples(), calibration.offset);
-                let problem = report_fit(&calibration, sectors, readings.samples().len());
-                match problem {
-                    None => {
+                let verdict = report_fit(&calibration, sectors, readings.samples().len());
+                match verdict {
+                    Verdict::Good | Verdict::Usable => {
                         print_constant(&calibration);
+                        let headline = if matches!(verdict, Verdict::Good) {
+                            "cal good"
+                        } else {
+                            "cal ok, see RTT"
+                        };
                         show(
                             &mut lcd,
                             &[
-                                format_args!("cal good"),
+                                format_args!("{headline}"),
+                                format_args!(
+                                    "~{:.1} deg error",
+                                    heading_error_deg(calibration.residual)
+                                ),
                                 format_args!("field {:.1} uT", calibration.field_ut),
-                                format_args!("resid {:.4}", calibration.residual),
                                 format_args!(
                                     "{}",
                                     if saved.is_ok() {
@@ -622,11 +641,8 @@ mod cal {
                         )
                         .await;
                     }
-                    Some(why) => {
-                        rprintln!(
-                            "Not usable: {}. Move away from iron and magnets and run it again.",
-                            why
-                        );
+                    Verdict::Unusable(why) => {
+                        rprintln!("Not usable: {}. Run it again.", why);
                         show(
                             &mut lcd,
                             &[
