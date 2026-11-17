@@ -669,7 +669,11 @@ mod sensors {
             if orientation.calibration == Accuracy::High {
                 ""
             } else {
-                " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)"
+                if MAG_CALIBRATION.is_none() {
+                    " (not calibrated: run imu_cal and set MAG_CALIBRATION)"
+                } else {
+                    " (keep turning and tilting the device to calibrate; if it persists, the field here is disturbed)"
+                }
             }
         );
     }
