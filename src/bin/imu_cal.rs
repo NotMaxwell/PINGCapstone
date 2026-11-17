@@ -149,8 +149,8 @@ mod cal {
         EXPECTED_FIELD_UT, IMU_SILENCE, LCD_REFRESH, MAG_REPORT_INTERVAL_US, RETRY_DELAY,
     };
     use ping_capstone::mag_cal::{
-        CAPACITY, Collector, FIELD_TOLERANCE, MAX_RESIDUAL, MAX_USABLE_RESIDUAL, MagCalibration,
-        REQUIRED_SECTORS, SECTORS, coverage, fit, heading_error_deg,
+        CAPACITY, Collector, FIELD_TOLERANCE, FitError, MAX_RESIDUAL, MAX_USABLE_RESIDUAL,
+        MagCalibration, REQUIRED_SECTORS, SECTORS, coverage, fit, heading_error_deg,
     };
     use ping_capstone::ssd1306::{ROWS, Ssd1306};
     use rtt_target::{rprint, rprintln};
@@ -192,6 +192,9 @@ mod cal {
     const ALIGNED_DEG: f32 = 20.0;
     /// How long to move the device about at each face.
     const SWEEP: Duration = Duration::from_secs(5);
+    /// How far off the fitted surface a reading may be, in standard
+    /// deviations of all of them, before it is dropped as an outlier.
+    const OUTLIER_LIMIT: f32 = 2.5;
     /// Standard gravity, m/s².
     const GRAVITY: f32 = 9.80665;
 
@@ -393,6 +396,34 @@ mod cal {
                 .await;
             }
         }
+    }
+
+    /// Fits, drops readings far off the fitted surface, and fits again. A
+    /// knock against something magnetic leaves a few readings that would
+    /// otherwise pull the whole fit. The dump at the end lists only what was
+    /// kept.
+    fn fit_without_outliers(readings: &mut Collector) -> Result<MagCalibration, FitError> {
+        let first = fit(readings.samples())?;
+        let error = |s: Vec3| {
+            let m = first.apply(s);
+            sqrtf(m.x * m.x + m.y * m.y + m.z * m.z) - first.field_ut
+        };
+        let before = readings.samples().len();
+        let spread = sqrtf(
+            readings
+                .samples()
+                .iter()
+                .map(|&s| error(s) * error(s))
+                .sum::<f32>()
+                / before as f32,
+        );
+        readings.retain(|s| error(s).abs() <= OUTLIER_LIMIT * spread);
+        let dropped = before - readings.samples().len();
+        if dropped == 0 {
+            return Ok(first);
+        }
+        rprintln!("Dropped {} outlying readings of {}", dropped, before);
+        fit(readings.samples())
     }
 
     /// How many sectors the readings cover around the centre a fit finds,
@@ -620,7 +651,7 @@ mod cal {
         }
 
         show(&mut lcd, &[format_args!("fitting...")]).await;
-        match fit(readings.samples()) {
+        match fit_without_outliers(&mut readings) {
             Ok(calibration) => {
                 let sectors = coverage(readings.samples(), calibration.offset);
                 let verdict = report_fit(&calibration, sectors, readings.samples().len());
