@@ -99,6 +99,9 @@ needs nothing but the display:
    Rotation is what counts; carrying it around does nothing useful.
 3. After the sixth face, **tumble it slowly through every direction** until
    `cover` reaches 24 of 26.
+4. When the display reads `set it down`, **rest it and leave it still**. The
+   hub's own calibration is saved after 10 s of rest, and tried again every
+   10 s, up to six times, if the hub refuses.
 
 Then it drops any readings far off the fit, fits again, and prints the result
 over RTT with an estimate of the heading error it leaves:
