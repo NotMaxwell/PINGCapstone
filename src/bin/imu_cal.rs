@@ -192,6 +192,10 @@ mod cal {
     const ALIGNED_DEG: f32 = 20.0;
     /// How long to move the device about at each face.
     const SWEEP: Duration = Duration::from_secs(5);
+    /// How long the device rests before each try at saving the hub's
+    /// calibration, and how many tries it gets.
+    const SAVE_SETTLE: Duration = Duration::from_secs(10);
+    const SAVE_ATTEMPTS: u32 = 6;
     /// How far off the fitted surface a reading may be, in standard
     /// deviations of all of them, before it is dropped as an outlier.
     const OUTLIER_LIMIT: f32 = 2.5;
@@ -621,8 +625,54 @@ mod cal {
 
         // Saved whatever the fit makes of the magnetometer: it is the hub's
         // accelerometer and gyroscope calibration, and it replaces whatever
-        // was in flash.
-        let mut saved = imu.save_calibration().await;
+        // was in flash. The hub refused saves made straight after the tumble
+        // (status 4, undocumented), so in case it will not save a
+        // calibration it is still settling, it first gets still time, which
+        // its gyroscope calibration also learns from.
+        rprintln!(
+            "Set the device down and leave it still: saving the hub's calibration, up to {} tries \
+             {} s apart.",
+            SAVE_ATTEMPTS,
+            SAVE_SETTLE.as_secs()
+        );
+        let mut saved = Ok(());
+        for attempt in 1..=SAVE_ATTEMPTS {
+            let end = Instant::now() + SAVE_SETTLE;
+            let mut next_refresh = Instant::now();
+            while Instant::now() < end {
+                next_accel(&mut imu, &mut readings).await;
+                if due(&mut next_refresh) {
+                    show_quietly(
+                        &mut lcd,
+                        &[
+                            format_args!("set it down"),
+                            format_args!("saving to hub"),
+                            format_args!("try {}/{}", attempt, SAVE_ATTEMPTS),
+                            format_args!(
+                                "in {} s",
+                                end.saturating_duration_since(Instant::now()).as_secs() + 1
+                            ),
+                        ],
+                    )
+                    .await;
+                }
+            }
+            saved = imu.save_calibration().await;
+            match &saved {
+                Ok(()) => {
+                    rprintln!("Save accepted on try {}/{}.", attempt, SAVE_ATTEMPTS);
+                    break;
+                }
+                Err(error) => {
+                    rprintln!(
+                        "Save try {}/{} refused: {:?}",
+                        attempt,
+                        SAVE_ATTEMPTS,
+                        error
+                    )
+                }
+            }
+        }
         match &saved {
             Ok(()) => {
                 rprintln!("The IMU confirmed saving its accelerometer and gyroscope calibration.")
